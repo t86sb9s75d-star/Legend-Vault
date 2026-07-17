@@ -21,10 +21,10 @@ jobs:
           set -euxo pipefail
           mkdir .bootstrap
           unzip -q Legend-Vault-GitHub-Baseline.zip -d .bootstrap
+          rm -rf .bootstrap/.github
           rsync -a .bootstrap/ ./
           rm -rf .bootstrap
           rm -f Legend-Vault-GitHub-Baseline.zip
-          rm -f .github/workflows/bootstrap.yml
 
       - name: Commit extracted files
         run: |
