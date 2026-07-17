@@ -1,0 +1,26 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+dist/
+build/
+.DS_Store
+
+# Legend Vault private/runtime data
+vault/
+records/
+exports/
+private/
+*.chatgpt-export.zip
+LegendVault_RawRecord*.zip
+LV-*.zip
+raw/
+original/
+
+# Local receipts and generated reports
+RUN_RESULTS.json
+PROJECT_HASHES.json
+*.git.bundle

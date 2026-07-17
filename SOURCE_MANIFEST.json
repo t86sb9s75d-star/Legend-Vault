@@ -1,0 +1,82 @@
+{
+  "package": "Legend-Vault-GitHub-Baseline",
+  "privacy": "Source-only; private transcript fixtures and generated records excluded.",
+  "test_result": "PASS",
+  "files": [
+    {
+      "path": ".github/workflows/ci.yml",
+      "bytes": 598,
+      "sha256": "cd01da25cf640f2cc177db00878598b61a6136bfc9779b2e337847a6db075da3"
+    },
+    {
+      "path": ".gitignore",
+      "bytes": 332,
+      "sha256": "a1683c3850e0e6e615f8cd067699f6b81becb5700c8d119bcc58107b73acdd19"
+    },
+    {
+      "path": "README.md",
+      "bytes": 1602,
+      "sha256": "d2b2b58bc080df7a6d857e71a766ae0df03d8503c31873e5afa56990c851b5a5"
+    },
+    {
+      "path": "SECURITY.md",
+      "bytes": 706,
+      "sha256": "130d4b64322d4de65064e9b306c8fe48b03254aa2d3e09591300067966289689"
+    },
+    {
+      "path": "docs/STATUS.md",
+      "bytes": 751,
+      "sha256": "927f38772f7f57cfbc7157c2328cf4e35373f48c72f7cdb0be4c72d2f06d9628"
+    },
+    {
+      "path": "fixtures/README.md",
+      "bytes": 221,
+      "sha256": "5cd596cd4a5a4be6060de7d05c4264fc8213e5427f86558ab551b699ba64ac72"
+    },
+    {
+      "path": "fixtures/legend_vault_verify_v0_1_1.py",
+      "bytes": 21740,
+      "sha256": "6571cff23d76e4f9f0d110669cf66ba2ed75fe60c51bc091206684dfa301b86e"
+    },
+    {
+      "path": "pyproject.toml",
+      "bytes": 457,
+      "sha256": "ba83e10e1a166de9191cc72cd09d3ecfea7843fc3e51f39bebe77cacd63a0870"
+    },
+    {
+      "path": "run-tests.sh",
+      "bytes": 129,
+      "sha256": "b8ad751b5a138910bdd500b269c6fd266d433adf88993666cc8999f466264a7e"
+    },
+    {
+      "path": "schemas/event.schema.json",
+      "bytes": 1841,
+      "sha256": "8691fe19b835025b739a473db2e1ef38448a69a2d7a0f4df6d8aa26ac51dac4f"
+    },
+    {
+      "path": "src/legend_vault/__init__.py",
+      "bytes": 22,
+      "sha256": "91447944015cec709e8aa7655f7e9d64e1e4508e7023a57fe3746911c0fc6fed"
+    },
+    {
+      "path": "src/legend_vault/__main__.py",
+      "bytes": 47,
+      "sha256": "79ee6f134c5c5193377cf9b189cbdcc3e2095e49ba9cec310114441c15a917c4"
+    },
+    {
+      "path": "src/legend_vault/cli.py",
+      "bytes": 2497,
+      "sha256": "8032d0fb7ab3448910f3b461fae3e379fe6fe7303eac54a03df0f48cd701f61e"
+    },
+    {
+      "path": "src/legend_vault/core.py",
+      "bytes": 29665,
+      "sha256": "207dd341ba43771f3ead1d19af9e9303cc80967fde7b0d8b76dda76bb99f4f06"
+    },
+    {
+      "path": "tests/test_synthetic_end_to_end.py",
+      "bytes": 2609,
+      "sha256": "8b9fd05b6e12798dafa772f052036997ca84002e37b5479bef5fc77aa28e2379"
+    }
+  ]
+}

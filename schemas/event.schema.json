@@ -1,0 +1,107 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://legend-vault.local/schemas/event.schema.json",
+  "title": "Legend Vault Event",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "event_id",
+    "record_id",
+    "sequence",
+    "actor",
+    "event_type",
+    "content",
+    "content_sha256",
+    "capture_method",
+    "fidelity"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "0.1.0"
+    },
+    "event_id": {
+      "type": "string"
+    },
+    "record_id": {
+      "type": "string"
+    },
+    "source_platform": {
+      "type": "string"
+    },
+    "source_conversation_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "source_message_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "parent_event_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "branch_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "sequence": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "actor": {
+      "enum": [
+        "user",
+        "assistant",
+        "tool",
+        "system",
+        "unknown"
+      ]
+    },
+    "event_type": {
+      "type": "string"
+    },
+    "created_at": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "timestamp_status": {
+      "type": "string"
+    },
+    "content": {
+      "type": "string"
+    },
+    "content_format": {
+      "type": "string"
+    },
+    "capture_method": {
+      "type": "string"
+    },
+    "fidelity": {
+      "type": "string"
+    },
+    "artifact_ids": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "content_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "source_metadata": {
+      "type": "object"
+    }
+  },
+  "additionalProperties": true
+}
