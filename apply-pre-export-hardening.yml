@@ -1,4 +1,4 @@
-name: .github/workflows/apply-pre-export-hardening.yml
+name: Apply pre-export hardening
 
 on:
   workflow_dispatch:
