@@ -14,6 +14,7 @@
 - Record verification
 - Exact and normalized event diff
 - Synthetic end-to-end test
+- Verifier fault-injection regression suite
 
 ## Not yet proven
 

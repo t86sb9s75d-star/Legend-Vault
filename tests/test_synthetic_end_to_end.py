@@ -66,4 +66,8 @@ def test_synthetic_import_verify_and_diff() -> None:
 
 if __name__ == "__main__":
     test_synthetic_import_verify_and_diff()
-    print("Synthetic end-to-end test passed.")
+
+    from test_verifier_fault_injection import test_fault_injection_suite
+
+    test_fault_injection_suite()
+    print("Synthetic end-to-end and verifier fault-injection tests passed.")

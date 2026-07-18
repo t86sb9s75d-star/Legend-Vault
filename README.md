@@ -56,6 +56,7 @@ runtime paths and archive names, but review every commit before pushing.
 
 ## Status
 
-The Python CLI baseline is runnable and its synthetic end-to-end path is tested.
+The Python CLI baseline is runnable, and its synthetic end-to-end and
+verifier fault-injection paths are tested.
 Compatibility with an official ChatGPT export must be validated against a real
 user-provided export without committing that export to GitHub.
