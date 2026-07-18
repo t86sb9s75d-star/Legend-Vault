@@ -1,0 +1,452 @@
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -10,6 +10,32 @@
+ authors = [{name = "Legend Vault"}]
+ dependencies = []
+ 
++[project.optional-dependencies]
++dev = [
++    "hypothesis>=6",
++    "pre-commit>=4",
++    "pytest>=8",
++    "ruff>=0.12",
++]
++ingestion = [
++    "docling",
++]
++memory-benchmark = [
++    "graphiti-core",
++    "mem0ai",
++    "qdrant-client",
++]
++agents = [
++    "mcp",
++    "openai-agents",
++]
++data-validation = [
++    "pandera",
++]
++data-ui = [
++    "datasette",
++]
++
+ [project.scripts]
+ legend-vault = "legend_vault.cli:main"
+ 
+@@ -18,3 +44,21 @@
+ 
+ [tool.setuptools.packages.find]
+ where = ["src"]
++
++[tool.pytest.ini_options]
++addopts = "-q"
++testpaths = ["tests"]
++
++[tool.ruff]
++target-version = "py310"
++line-length = 100
++extend-exclude = [
++    "fixtures",
++    "legend_vault_verify (MODEL 2.0).py",
++]
++
++[tool.ruff.lint]
++# Begin with correctness-focused checks so the quality gate strengthens the
++# current baseline without silently reformatting historical artifacts.
++select = ["E4", "E7", "E9", "F"]
++ignore = ["E501"]
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -8,7 +8,7 @@
+   contents: read
+ 
+ jobs:
+-  test:
++  quality:
+     runs-on: ubuntu-latest
+ 
+     strategy:
+@@ -24,11 +24,17 @@
+         with:
+           python-version: ${{ matrix.python-version }}
+ 
+-      - name: Install package
+-        run: python -m pip install -e .
++      - name: Upgrade packaging tools
++        run: python -m pip install --upgrade pip
++
++      - name: Install package and development stack
++        run: python -m pip install -e ".[dev]"
+ 
+       - name: Compile source
+         run: python -m compileall -q src tests
+ 
+-      - name: Run synthetic end-to-end test
+-        run: python tests/test_synthetic_end_to_end.py
++      - name: Run correctness-focused Ruff checks
++        run: python -m ruff check .
++
++      - name: Run test suite
++        run: python -m pytest
+--- a/README.md
++++ b/README.md
+@@ -38,6 +38,32 @@
+ legend-vault diff RECORD_A.zip RECORD_B.zip
+ ```
+ 
++## Development stack
++
++Install the quality and test layer:
++
++```bash
++python -m pip install -e ".[dev]"
++pre-commit install
++python -m ruff check .
++python -m pytest
++```
++
++The core package remains dependency-free. Heavier capabilities are isolated in
++optional extras and do not become authoritative simply because they are
++installed:
++
++```bash
++python -m pip install -e ".[ingestion]"
++python -m pip install -e ".[memory-benchmark]"
++python -m pip install -e ".[agents]"
++python -m pip install -e ".[data-validation]"
++python -m pip install -e ".[data-ui]"
++```
++
++See [`docs/STACK.md`](docs/STACK.md) for the active stack, pilot gates, and
++deferred components.
++
+ ## Trust boundary
+ 
+ - The original source ZIP is preserved unchanged in a built record.
+@@ -47,6 +73,8 @@
+ - Internal hashes alone do not prove faithful capture at origin.
+ - A coordinated rewrite with a regenerated ledger remains undetectable without
+   an external receipt or source comparison.
++- Optional AI, retrieval, parsing, or database layers may propose derived facts,
++  but they may not overwrite the preserved source or canonical event stream.
+ 
+ ## Privacy
+ 
+--- /dev/null
++++ b/.pre-commit-config.yaml
+@@ -0,0 +1,23 @@
++repos:
++  - repo: local
++    hooks:
++      - id: compileall
++        name: Compile Legend Vault source
++        entry: python -m compileall -q src tests
++        language: system
++        pass_filenames: false
++        always_run: true
++
++      - id: ruff-check
++        name: Ruff correctness checks
++        entry: python -m ruff check .
++        language: system
++        pass_filenames: false
++        always_run: true
++
++      - id: pytest
++        name: Legend Vault tests
++        entry: python -m pytest
++        language: system
++        pass_filenames: false
++        always_run: true
+--- /dev/null
++++ b/tests/test_properties.py
+@@ -0,0 +1,83 @@
++from __future__ import annotations
++
++import re
++from typing import Any
++
++from hypothesis import given, strategies as st
++
++from legend_vault.core import flatten_content, normalize_actor, stable_event_id
++
++
++TEXT = st.text(max_size=64)
++CONTENT_HASH = st.text(min_size=1, max_size=128)
++EVENT_ID_RE = re.compile(r"^evt_[0-9a-f]{32}$")
++
++
++@given(
++    record_id=TEXT,
++    source_message_id=st.one_of(st.none(), TEXT),
++    sequence=st.integers(min_value=0, max_value=2**31 - 1),
++    content_hash=CONTENT_HASH,
++)
++def test_stable_event_id_is_deterministic(
++    record_id: str,
++    source_message_id: str | None,
++    sequence: int,
++    content_hash: str,
++) -> None:
++    first = stable_event_id(record_id, source_message_id, sequence, content_hash)
++    second = stable_event_id(record_id, source_message_id, sequence, content_hash)
++
++    assert first == second
++    assert EVENT_ID_RE.fullmatch(first)
++
++
++@given(
++    record_id=TEXT,
++    source_message_id=st.one_of(st.none(), TEXT),
++    sequence=st.integers(min_value=0, max_value=2**31 - 2),
++    content_hash=CONTENT_HASH,
++)
++def test_stable_event_id_changes_when_sequence_changes(
++    record_id: str,
++    source_message_id: str | None,
++    sequence: int,
++    content_hash: str,
++) -> None:
++    current = stable_event_id(record_id, source_message_id, sequence, content_hash)
++    following = stable_event_id(record_id, source_message_id, sequence + 1, content_hash)
++
++    assert current != following
++
++
++@given(role=st.one_of(st.none(), TEXT))
++def test_normalize_actor_returns_only_declared_actors(role: str | None) -> None:
++    normalized = normalize_actor(role)
++    allowed = {"user", "assistant", "tool", "system", "unknown"}
++
++    assert normalized in allowed
++    if role is not None and role.lower() in allowed - {"unknown"}:
++        assert normalized == role.lower()
++    else:
++        assert normalized == "unknown"
++
++
++SAFE_KEYS = st.text(min_size=1, max_size=20).filter(
++    lambda key: key not in {"parts", "text"}
++)
++JSON_SCALARS = st.one_of(
++    st.none(),
++    st.booleans(),
++    st.integers(),
++    st.floats(allow_nan=False, allow_infinity=False),
++    st.text(max_size=40),
++)
++
++
++@given(payload=st.dictionaries(SAFE_KEYS, JSON_SCALARS, max_size=20))
++def test_flatten_content_is_stable_across_dictionary_order(
++    payload: dict[str, Any],
++) -> None:
++    reversed_payload = dict(reversed(list(payload.items())))
++
++    assert flatten_content(payload) == flatten_content(reversed_payload)
+--- /dev/null
++++ b/docs/STACK.md
+@@ -0,0 +1,203 @@
++# Legend Vault technology stack
++
++## Governing rule
++
++Legend Vault remains a raw-first archival system. A new library is not part of
++the authority hierarchy merely because it is installed.
++
++The preserved source archive and `raw/events.jsonl` remain above every parser,
++embedding, graph, model, agent, dashboard, and generated summary.
++
++## Active baseline
++
++These components are approved for the current repository:
++
++| Component | Role | Authority |
++|---|---|---|
++| Python standard library | Archive import, canonicalization, verification, and diff | Runtime core |
++| pytest | Test discovery and execution | Executable evidence only |
++| Hypothesis | Property-based invariant testing | Executable evidence only |
++| Ruff | Correctness-focused static checks | Quality gate |
++| pre-commit | Local quality gate before commits | Workflow control |
++| GitHub Actions | Clean-environment CI across supported Python versions | Repeatability evidence |
++
++Install with:
++
++```bash
++python -m pip install -e ".[dev]"
++pre-commit install
++```
++
++## Optional pilot: document ingestion
++
++### Docling
++
++Repository: <https://github.com/docling-project/docling>
++
++Purpose:
++
++- parse PDFs, Office files, email, images, audio, and structured document layout;
++- preserve tables, reading order, formulas, and document structure where possible;
++- run locally when records are sensitive.
++
++Install:
++
++```bash
++python -m pip install -e ".[ingestion]"
++```
++
++Gate before use:
++
++1. Keep the original binary unchanged.
++2. Store parser output as a derived layer.
++3. Record parser name and version.
++4. Measure omissions and transformations against known fixtures.
++5. Never silently replace unavailable source material with generated text.
++
++## Optional benchmark: memory and retrieval
++
++Install the benchmark candidates with:
++
++```bash
++python -m pip install -e ".[memory-benchmark]"
++```
++
++### Graphiti
++
++Repository: <https://github.com/getzep/graphiti>
++
++Candidate role: temporal context graph with provenance and changing facts.
++
++### Mem0
++
++Repository: <https://github.com/mem0ai/mem0>
++
++Candidate role: compact user, session, and agent memory retrieval.
++
++### Qdrant
++
++Repository: <https://github.com/qdrant/qdrant>
++
++Candidate role: vector retrieval only after local retrieval no longer meets the
++measured scale or latency requirement.
++
++Benchmark requirements:
++
++- identical source corpus;
++- identical question set;
++- recall, precision, provenance, temporal accuracy, latency, and token usage;
++- named false positives and false negatives;
++- no architecture decision based only on vendor benchmarks.
++
++No memory system may alter the raw archive or canonical event stream.
++
++## Optional pilot: agents and tools
++
++Install with:
++
++```bash
++python -m pip install -e ".[agents]"
++```
++
++### OpenAI Agents SDK
++
++Repository: <https://github.com/openai/openai-agents-python>
++
++Candidate role: tool orchestration, guardrails, handoffs, human approval, and
++tracing.
++
++### Model Context Protocol SDK
++
++Repository: <https://github.com/modelcontextprotocol/python-sdk>
++
++Candidate role: controlled interfaces to files, databases, parsers, and other
++tools.
++
++Agent boundary:
++
++- read-only by default;
++- explicit approval before deletion, publication, export, or external writes;
++- every tool call logged;
++- generated interpretations labeled as derived;
++- no hidden mutation of source or integrity metadata.
++
++## Optional structured-data validation
++
++### Pandera
++
++Repository: <https://github.com/unionai-oss/pandera>
++
++Install:
++
++```bash
++python -m pip install -e ".[data-validation]"
++```
++
++Use only when Legend Vault introduces dataframe-like import, calibration, or
++evaluation datasets. It is not currently required by the archive core.
++
++## Optional data exploration
++
++### Datasette
++
++Repository: <https://github.com/simonw/datasette>
++
++Install:
++
++```bash
++python -m pip install -e ".[data-ui]"
++```
++
++Candidate role: read-only exploration and API access for future SQLite indexes.
++It must not become a path for bypassing record verification or editing
++authoritative data.
++
++## External quality and security tools
++
++These tools are tracked as part of the engineering stack but are intentionally
++not Python project dependencies.
++
++### Promptfoo
++
++Repository: <https://github.com/promptfoo/promptfoo>
++
++Use for repeatable LLM evaluations, regression checks, and red teaming before
++any AI-derived feature is treated as usable.
++
++### Betterleaks
++
++Repository: <https://github.com/betterleaks/betterleaks>
++
++Use to scan commits, branches, pull requests, and local files for exposed
++credentials or tokens.
++
++### Semgrep
++
++Repository: <https://github.com/semgrep/semgrep>
++
++Use for targeted secure-coding rules. Start with narrow, reviewed rules rather
++than a noisy all-rules gate.
++
++### No-Mistakes
++
++Repository: <https://github.com/kunchenguid/no-mistakes>
++
++Use only as a controlled pre-push pilot. AI-generated fixes stay disabled until
++the review quality has been measured against known defects.
++
++## Deferred product and workflow components
++
++The following repositories remain research references, not active dependencies:
++
++- <https://github.com/khoj-ai/khoj>
++- <https://github.com/run-llama/llama_index>
++- <https://github.com/Unstructured-IO/unstructured>
++- <https://github.com/n8n-io/n8n>
++- <https://github.com/twentyhq/twenty>
++- <https://github.com/supabase/supabase>
++- <https://github.com/browserbase/stagehand>
++- <https://github.com/browser-use/browser-use>
++- <https://github.com/alibaba/page-agent>
++
++Each requires a concrete use case, threat model, license review, maintenance
++review, and measured benefit before adoption.
