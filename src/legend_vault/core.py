@@ -217,19 +217,51 @@ def parse_chatgpt_export(zip_path: Path, conversation_selector: str | None = Non
     source_hash = sha256_file(zip_path)
     with zipfile.ZipFile(zip_path) as zf:
         names = zf.namelist()
-        conversations_name = next((name for name in names if name.rstrip("/") == "conversations.json"), None)
-        if conversations_name is None:
-            conversations_name = next((name for name in names if name.endswith("/conversations.json")), None)
-        if conversations_name is None:
-            raise LegendVaultError("No conversations.json was found in the ZIP.")
+        conversation_shards = sorted(
+            name
+            for name in names
+            if (
+                name.rsplit("/", 1)[-1].startswith("conversations-")
+                and name.rsplit("/", 1)[-1].endswith(".json")
+            )
+        )
+        if conversation_shards:
+            conversations_name = conversation_shards[0]
+            conversations = []
+            for shard_name in conversation_shards:
+                try:
+                    shard = json.loads(zf.read(shard_name))
+                except Exception as exc:
+                    raise LegendVaultError(
+                        f"Could not parse conversation shard {shard_name}: {exc}"
+                    ) from exc
+                if not isinstance(shard, list):
+                    raise LegendVaultError(
+                        f"Conversation shard {shard_name} is not a list."
+                    )
+                conversations.extend(shard)
+        else:
+            conversations_name = next(
+                (name for name in names if name.rstrip("/") == "conversations.json"),
+                None,
+            )
+            if conversations_name is None:
+                conversations_name = next(
+                    (name for name in names if name.endswith("/conversations.json")),
+                    None,
+                )
+            if conversations_name is None:
+                raise LegendVaultError(
+                    "No conversations.json or conversations-*.json shard was found in the ZIP."
+                )
 
-        try:
-            conversations = json.loads(zf.read(conversations_name))
-        except Exception as exc:
-            raise LegendVaultError(f"Could not parse {conversations_name}: {exc}") from exc
+            try:
+                conversations = json.loads(zf.read(conversations_name))
+            except Exception as exc:
+                raise LegendVaultError(f"Could not parse {conversations_name}: {exc}") from exc
 
-        if not isinstance(conversations, list):
-            raise LegendVaultError("conversations.json is not a list.")
+            if not isinstance(conversations, list):
+                raise LegendVaultError("conversations.json is not a list.")
 
         chosen: list[dict[str, Any]]
         if conversation_selector:
