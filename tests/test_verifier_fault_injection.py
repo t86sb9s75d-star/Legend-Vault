@@ -5,6 +5,7 @@ from pathlib import Path
 import tempfile
 import zipfile
 
+import legend_vault.core as core
 from legend_vault.core import build_record, sha256_bytes, verify_record_zip
 
 
@@ -275,6 +276,37 @@ def test_unmanifested_file(valid: Path, root: Path) -> None:
     assert_rejected_with(damaged, "UNMANIFESTED_FILE")
 
 
+def test_member_too_large(valid: Path, root: Path) -> None:
+    entries = read_entries(valid)
+    event_name, _ = get_entry(entries, "/raw/events.jsonl")
+    root_prefix = event_name[: -len("raw/events.jsonl")]
+    old_limit = core.MAX_ZIP_MEMBER_BYTES
+    core.MAX_ZIP_MEMBER_BYTES = 1024
+    try:
+        entries.append((root_prefix + "oversized.bin", b"x" * 2048))
+        damaged = root / "member-too-large.zip"
+        write_entries(damaged, entries)
+        assert_rejected_with(damaged, "MEMBER_TOO_LARGE")
+    finally:
+        core.MAX_ZIP_MEMBER_BYTES = old_limit
+
+
+def test_total_uncompressed_limit(valid: Path, root: Path) -> None:
+    entries = read_entries(valid)
+    event_name, _ = get_entry(entries, "/raw/events.jsonl")
+    root_prefix = event_name[: -len("raw/events.jsonl")]
+    old_limit = core.MAX_ZIP_TOTAL_BYTES
+    core.MAX_ZIP_TOTAL_BYTES = 4096
+    try:
+        entries.append((root_prefix + "near-limit-a.bin", b"a" * 2500))
+        entries.append((root_prefix + "near-limit-b.bin", b"b" * 2500))
+        damaged = root / "total-uncompressed-limit.zip"
+        write_entries(damaged, entries)
+        assert_rejected_with(damaged, "ZIP_TOTAL_UNCOMPRESSED_LIMIT")
+    finally:
+        core.MAX_ZIP_TOTAL_BYTES = old_limit
+
+
 def test_fault_injection_suite() -> None:
     with tempfile.TemporaryDirectory() as temp_dir:
         root = Path(temp_dir)
@@ -288,6 +320,8 @@ def test_fault_injection_suite() -> None:
             test_unsafe_path,
             test_invalid_integrity_json,
             test_unmanifested_file,
+            test_member_too_large,
+            test_total_uncompressed_limit,
         ]
         for case in cases:
             case(valid, root)

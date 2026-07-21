@@ -24,6 +24,10 @@ EVENT_RE = re.compile(
     re.MULTILINE,
 )
 ATTACHMENT_RE = re.compile(r"^- `([^`]+)`", re.MULTILINE)
+MAX_ZIP_ENTRY_COUNT = 10_000
+MAX_ZIP_MEMBER_BYTES = 64 * 1024 * 1024
+MAX_ZIP_TOTAL_BYTES = 256 * 1024 * 1024
+MAX_ZIP_COMPRESSION_RATIO = 100.0
 
 
 class LegendVaultError(RuntimeError):
@@ -590,24 +594,60 @@ def verify_record_zip(path: Path) -> dict[str, Any]:
         with zipfile.ZipFile(path) as zf:
             infos = zf.infolist()
             names = [info.filename for info in infos]
-            bad = zf.testzip()
-            files = {info.filename: zf.read(info) for info in infos}
+            files: dict[str, bytes] = {}
+
+            if len(infos) > MAX_ZIP_ENTRY_COUNT:
+                result["errors"].append({
+                    "code": "ZIP_ENTRY_LIMIT",
+                    "detail": f"{len(infos)} > {MAX_ZIP_ENTRY_COUNT}"
+                })
+
+            oversized_members: set[str] = set()
+            declared_total_size = 0
+
+            # Security checks that only require central directory metadata.
+            for info in infos:
+                name = info.filename
+                normalized = os.path.normpath(name)
+                if name.startswith("/") or normalized.startswith("..") or "/../" in f"/{name}/":
+                    result["errors"].append({"code": "UNSAFE_PATH", "detail": name})
+                ratio = info.file_size / info.compress_size if info.compress_size else (999999 if info.file_size else 1)
+                if ratio > MAX_ZIP_COMPRESSION_RATIO:
+                    result["errors"].append({"code": "COMPRESSION_RATIO", "detail": f"{name}: {ratio:.2f}"})
+                if info.file_size > MAX_ZIP_MEMBER_BYTES:
+                    oversized_members.add(name)
+                    result["errors"].append({
+                        "code": "MEMBER_TOO_LARGE",
+                        "detail": f"{name}: {info.file_size} > {MAX_ZIP_MEMBER_BYTES}"
+                    })
+                declared_total_size += info.file_size
+
+            if declared_total_size > MAX_ZIP_TOTAL_BYTES:
+                result["errors"].append({
+                    "code": "ZIP_TOTAL_UNCOMPRESSED_LIMIT",
+                    "detail": f"{declared_total_size} > {MAX_ZIP_TOTAL_BYTES}"
+                })
+
+            # Avoid forced decompression on archives already over hard limits.
+            if not oversized_members and declared_total_size <= MAX_ZIP_TOTAL_BYTES:
+                bad = zf.testzip()
+                if bad:
+                    result["errors"].append({"code": "ZIP_CRC_FAILURE", "detail": bad})
+
+            # Read only non-directory members and skip files above the hard cap.
+            for info in infos:
+                if info.is_dir() or info.filename.endswith("/") or info.filename in oversized_members:
+                    continue
+                try:
+                    files[info.filename] = zf.read(info)
+                except Exception as exc:
+                    result["errors"].append({
+                        "code": "ZIP_READ_FAILED",
+                        "detail": f"{info.filename}: {exc}"
+                    })
     except Exception as exc:
         result["errors"].append({"code": "ZIP_OPEN_FAILED", "detail": str(exc)})
         return result
-
-    if bad:
-        result["errors"].append({"code": "ZIP_CRC_FAILURE", "detail": bad})
-
-    # Security checks
-    for info in infos:
-        name = info.filename
-        normalized = os.path.normpath(name)
-        if name.startswith("/") or normalized.startswith("..") or "/../" in f"/{name}/":
-            result["errors"].append({"code": "UNSAFE_PATH", "detail": name})
-        ratio = info.file_size / info.compress_size if info.compress_size else (999999 if info.file_size else 1)
-        if ratio > 100:
-            result["errors"].append({"code": "COMPRESSION_RATIO", "detail": f"{name}: {ratio:.2f}"})
 
     counts = collections.Counter(names)
     for name, count in counts.items():
@@ -623,6 +663,9 @@ def verify_record_zip(path: Path) -> dict[str, Any]:
     }
     for missing in sorted(required - set(logical_files)):
         result["errors"].append({"code": "MISSING_REQUIRED_FILE", "detail": missing})
+
+    if "integrity/manifest.json" not in logical_files or "integrity/hashes.json" not in logical_files:
+        return result
 
     try:
         manifest = json.loads(logical_files["integrity/manifest.json"])
