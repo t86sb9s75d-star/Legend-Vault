@@ -7,6 +7,7 @@ from pathlib import Path
 import sys
 
 from .core import LegendVaultError, build_record, diff_records, verify_record_zip
+from .privacy import PrivateDataBoundaryError, assert_private_data_path
 
 
 def main() -> int:
@@ -33,7 +34,11 @@ def main() -> int:
 
     try:
         if args.command == "import":
-            args.output.mkdir(parents=True, exist_ok=True)
+            # No mkdir here: build_record runs the privacy guard before it
+            # creates the output tree, so nothing is written until the
+            # destination is proven to be outside the repository. Real ingestion
+            # is classified "private" by default (fail-closed); the CLI exposes
+            # no synthetic override.
             record_dir, archive_path, summary = build_record(
                 args.source, args.output, conversation_selector=args.conversation
             )
@@ -54,6 +59,13 @@ def main() -> int:
             result = diff_records(args.left, args.right)
             rendered = json.dumps(result, indent=2)
             if args.json_out:
+                # A diff report is derived private data; refuse to write it into
+                # the repository.
+                assert_private_data_path(
+                    args.json_out,
+                    purpose="diff report output",
+                    classification="private",
+                )
                 args.json_out.write_text(rendered + "\n", encoding="utf-8")
             print(rendered)
             return 0
@@ -62,7 +74,9 @@ def main() -> int:
             print(args.record.resolve())
             return 0
 
-    except (LegendVaultError, OSError, ValueError, KeyError) as exc:
+    except (PrivateDataBoundaryError, LegendVaultError, OSError, ValueError, KeyError) as exc:
+        # str(exc) carries only the operation and the rejected destination for
+        # boundary errors — never file contents or export metadata.
         print(json.dumps({"status": "error", "error": str(exc)}, indent=2), file=sys.stderr)
         return 2
 
