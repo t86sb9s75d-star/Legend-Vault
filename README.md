@@ -3,6 +3,23 @@
 Legend Vault is a raw-first, local archival tool for importing, canonicalizing,
 verifying, inspecting, and comparing conversation records.
 
+## Private-data boundary
+
+> **This public repository contains software only.** Never place real exports,
+> vault records, attachments, receipts, logs, indexes, databases, temporary
+> extracted files, or private reports inside this Git working tree. Use a
+> separate private data directory outside the repository.
+
+- The current supported surface is **local-first and single-owner**.
+- **No live model provider is active** — no API key, no external inference.
+- **No real export may be sent to any external service** (no model provider, no
+  telemetry, no analytics).
+- **Synthetic fixtures are the only data permitted inside the repository.**
+
+A fail-closed runtime guard (`legend_vault.privacy`) refuses to read a real
+export from, or write records into, a Git working tree. See
+[`docs/PRIVATE_DATA_BOUNDARY.md`](docs/PRIVATE_DATA_BOUNDARY.md).
+
 ## Current v0.1 scope
 
 ```text
@@ -20,19 +37,22 @@ python -m pip install -e .
 legend-vault --help
 ```
 
-Import a supported ZIP:
+Import a supported ZIP. The source and `--output` must be **outside** this
+repository (see the private-data boundary above); the importer refuses paths
+inside a Git working tree:
 
 ```bash
-legend-vault import SOURCE.zip --output vault
+legend-vault import ../Legend-Vault-Data/incoming/SOURCE.zip \
+  --output ../Legend-Vault-Data/records
 ```
 
 Verify a built record:
 
 ```bash
-legend-vault verify vault/LV-....zip
+legend-vault verify ../Legend-Vault-Data/records/LV-....zip
 ```
 
-Compare two records:
+Compare two records (paths outside the repository):
 
 ```bash
 legend-vault diff RECORD_A.zip RECORD_B.zip
@@ -51,8 +71,11 @@ legend-vault diff RECORD_A.zip RECORD_B.zip
 ## Privacy
 
 Do not commit private exports, raw transcripts, generated records, or personal
-artifacts to this repository. The `.gitignore` excludes common Legend Vault
-runtime paths and archive names, but review every commit before pushing.
+artifacts to this repository. The primary control is the fail-closed runtime
+guard in `legend_vault.privacy`, which refuses private-data operations inside a
+Git working tree; `.gitignore` is defense in depth, not the control. Review
+every commit before pushing, and read
+[`docs/PRIVATE_DATA_BOUNDARY.md`](docs/PRIVATE_DATA_BOUNDARY.md).
 
 ## Status
 

@@ -16,6 +16,8 @@ import uuid
 import zipfile
 from typing import Any, Iterable
 
+from .privacy import DataClassification, assert_private_data_path
+
 SCHEMA_VERSION = "0.1.0"
 NAMESPACE = uuid.UUID("f4e91854-9063-4f42-b3c6-1d55b6042c47")
 EVENT_RE = re.compile(
@@ -438,7 +440,26 @@ def build_record(
     output_root: Path,
     *,
     conversation_selector: str | None = None,
+    classification: DataClassification = "private",
+    allow_synthetic_git_worktree: bool = False,
 ) -> tuple[Path, Path, dict[str, Any]]:
+    # Privacy boundary (fail-closed): refuse to read a real export from, or write
+    # records into, a Git working tree. This runs before any ZIP is opened and
+    # before any directory is deleted or created. Real ingestion defaults to
+    # "private"; synthetic callers must opt in explicitly. See legend_vault.privacy.
+    assert_private_data_path(
+        source_zip,
+        purpose="ChatGPT export source",
+        classification=classification,
+        allow_synthetic_git_worktree=allow_synthetic_git_worktree,
+    )
+    assert_private_data_path(
+        output_root,
+        purpose="Legend Vault output",
+        classification=classification,
+        allow_synthetic_git_worktree=allow_synthetic_git_worktree,
+    )
+
     events, gaps, artifacts, source_metadata = detect_and_parse(source_zip, conversation_selector)
     if not events:
         raise LegendVaultError("The importer produced zero events.")

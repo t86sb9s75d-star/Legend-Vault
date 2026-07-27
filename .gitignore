@@ -24,3 +24,57 @@ original/
 RUN_RESULTS.json
 PROJECT_HASHES.json
 *.git.bundle
+
+# ---------------------------------------------------------------------------
+# Private-data boundary (see docs/PRIVATE_DATA_BOUNDARY.md). Defense in depth:
+# these ignores back up the runtime guard in legend_vault.privacy; they are not
+# the primary control. Never rely on .gitignore alone to keep private data out.
+# ---------------------------------------------------------------------------
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+credentials*
+secrets*/
+
+# Real ChatGPT exports and account payloads
+chatgpt-export*.zip
+conversations.json
+conversations-*.json
+chat.html
+user.json
+user_settings.json
+message_feedback.json
+library_files.json
+conversation_asset_file_names.json
+ads.json
+export_manifest.json
+*.dat
+
+# Private Legend Vault data
+incoming/
+vault-data/
+receipts/
+reports/private/
+discrepancy-reports/private/
+assets/private/
+LV-*/
+*.private.json
+*.private.md
+
+# Local databases, logs, caches, and indexes
+*.sqlite
+*.sqlite3
+*.db
+logs/
+*.log
+indexes/
+embeddings/
+cache/
+caches/
+tmp/private/
+temp/private/

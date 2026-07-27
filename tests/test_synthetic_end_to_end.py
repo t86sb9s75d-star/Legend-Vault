@@ -91,7 +91,16 @@ def test_synthetic_import_verify_and_diff() -> None:
         output = root / "vault"
         build_synthetic_export(source)
 
-        record_dir, archive_path, summary = build_record(source, output)
+        # Synthetic fixtures must declare their classification explicitly. The
+        # override matters only inside a Git worktree (here the destination is a
+        # temp dir), but the declaration is kept explicit so real ingestion can
+        # never silently reuse the synthetic path.
+        record_dir, archive_path, summary = build_record(
+            source,
+            output,
+            classification="synthetic",
+            allow_synthetic_git_worktree=True,
+        )
         assert record_dir.exists()
         assert archive_path.exists()
         assert summary["source_format"] == "chatgpt_export"
