@@ -67,6 +67,25 @@ def _expect_boundary_error(func) -> PrivateDataBoundaryError:
     raise AssertionError("expected PrivateDataBoundaryError, but none was raised")
 
 
+def _assert_inside_worktree_matrix(target: Path) -> None:
+    """For a path inside a worktree under *either* interpretation: private and
+    secret are always refused; synthetic is refused unless the explicit override
+    is set."""
+    _expect_boundary_error(lambda: assert_private_data_path(
+        target, purpose="derived output", classification="private"))
+    _expect_boundary_error(lambda: assert_private_data_path(
+        target, purpose="secret material", classification="secret"))
+    _expect_boundary_error(lambda: assert_private_data_path(
+        target, purpose="synthetic fixture", classification="synthetic"))
+    # The explicit synthetic override is allowed even inside a worktree.
+    assert_private_data_path(
+        target,
+        purpose="synthetic fixture",
+        classification="synthetic",
+        allow_synthetic_git_worktree=True,
+    )
+
+
 # --- cases --------------------------------------------------------------------
 
 
@@ -269,6 +288,55 @@ def test_environment_variables_cannot_enable_override() -> None:
                 os.environ[key] = value
 
 
+def test_symlink_repo_child_to_external_is_not_a_bypass() -> None:
+    # Regression for the Copilot finding: a path lexically inside the repo
+    # (repo/vault) that is a symlink to an external directory must still be
+    # refused for private data. Resolving symlinks first would have permitted it.
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        repo = _make_worktree(root)
+        external = root / "external"
+        external.mkdir()
+        (repo / "vault").symlink_to(external, target_is_directory=True)
+        _expect_boundary_error(lambda: assert_private_data_path(
+            repo / "vault", purpose="Legend Vault output", classification="private"))
+        _expect_boundary_error(lambda: assert_private_data_path(
+            repo / "vault" / "records" / "data.json",
+            purpose="record", classification="private"))
+
+
+def test_symlink_inside_repo_pointing_outside() -> None:
+    # A symlink that lives inside the repo but points to an external directory.
+    # The lexical path is inside the worktree, so it must be refused across the
+    # symlink itself, a nested child, and a not-yet-created child.
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        repo = _make_worktree(root)
+        external = root / "external"
+        (external / "records").mkdir(parents=True)
+        link = repo / "link"
+        link.symlink_to(external, target_is_directory=True)
+        _assert_inside_worktree_matrix(link)
+        _assert_inside_worktree_matrix(link / "records")
+        _assert_inside_worktree_matrix(link / "newdir" / "newfile")
+
+
+def test_symlink_outside_repo_pointing_inside() -> None:
+    # A symlink that lives outside the repo but points into it. The lexical path
+    # is outside, but the resolved target is inside, so it must be refused across
+    # the symlink itself, a nested child, and a not-yet-created child.
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        repo = _make_worktree(root)
+        vault = repo / "vault"
+        (vault / "records").mkdir(parents=True)
+        link = root / "outside_link"
+        link.symlink_to(vault, target_is_directory=True)
+        _assert_inside_worktree_matrix(link)
+        _assert_inside_worktree_matrix(link / "records")
+        _assert_inside_worktree_matrix(link / "newdir" / "newfile")
+
+
 _TESTS = [
     test_reject_existing_private_file_in_worktree,
     test_reject_not_yet_created_private_output_in_worktree,
@@ -286,6 +354,9 @@ _TESTS = [
     test_missing_classification_rejected_by_signature,
     test_nested_private_destinations_in_worktree_rejected,
     test_environment_variables_cannot_enable_override,
+    test_symlink_repo_child_to_external_is_not_a_bypass,
+    test_symlink_inside_repo_pointing_outside,
+    test_symlink_outside_repo_pointing_inside,
 ]
 
 
