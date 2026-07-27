@@ -1,10 +1,14 @@
 # Legend Vault Stress Test — Reproducible Revision 2
 
-**Source archive:** `LegendVault RawRecord 2026-07-16.zip`  
-**Source SHA-256:** `8c65f0fbf5987bb434a223c9926dc5b92403a9f7d0d08b03353dfde5e6387f40`  
-**Verifier:** `legend_vault_verify.py` v0.1.0  
-**Verifier SHA-256:** `0229acfa06f34911f83e58d465066bfd9f52b164a66aab5b2b0652098796b07d`  
-**Standard-library only:** Yes
+> **This public report uses synthetic or redacted evidence.** Real-export
+> identifiers, fingerprints, and measurements are retained only in private audit
+> records outside the repository.
+
+- **Source archive:** `<private export archive — redacted>`
+- **Source SHA-256:** `<redacted>`
+- **Verifier:** `legend_vault_verify.py` v0.1.0
+- **Verifier SHA-256:** `<redacted>`
+- **Standard-library only:** Yes
 
 ## Corrections to Revision 1
 
@@ -24,20 +28,21 @@ Revision 2 includes:
 
 ### 2. The internal-heading count was wrong
 
-The earlier report stated **150 internal headings**. The reproducible formula is:
+The earlier report used an internal-heading count that silently excluded some
+heading levels: it counted only non-event `##` headings and omitted `#`, `###`,
+and deeper headings. That measurement is withdrawn. The corrected, reproducible
+formula is:
 
 ```text
 all Markdown headings
 − archive title heading
 − event headings
 = internal message headings
-
-425 − 1 − 124 = 300
 ```
 
-Correct result: **300 internal message headings**.
-
-The prior value of 150 counted only non-event `##` headings and silently excluded `#`, `###`, and deeper headings. That measurement is withdrawn.
+The specific counts were derived from the private export and have been removed
+from this public report. They are retained only in private audit records
+outside the repository.
 
 ### 3. The scoreboard wording overstated the archive's defenses
 
@@ -61,24 +66,20 @@ Therefore, the accurate statement is:
 
 ## Independently reproduced measurements
 
-| Measurement | Result |
-|---|---:|
-| Compressed source ZIP bytes | 66,626 |
-| ZIP entries | 5 |
-| Parsed events | 124 |
-| User / Assistant / Tool | 61 / 60 / 3 |
-| Valid ISO timestamps | 61 |
-| Unavailable timestamps | 63 |
-| Code-fence lines | 218 |
-| All Markdown headings | 425 |
-| Archive-title headings | 1 |
-| Event headings | 124 |
-| Internal message headings | 300 |
+The independently reproduced measurements — archive size, entry count, parsed
+event count, actor breakdown, timestamp availability, and code-fence and heading
+counts — were derived from the private export. They have been removed from this
+public report and are retained only in private audit records outside the
+repository.
+
+The methodology remains reproducible: measurements are produced by running the
+standard-library verifier over the source archive and parsing its canonical
+event stream. Anyone holding the private export can reproduce them locally.
 
 ## Reproducible command
 
 ```bash
-python legend_vault_verify.py "LegendVault RawRecord 2026-07-16.zip" \
+python legend_vault_verify.py "<private export archive — redacted>" \
   --fault-test \
   --json-out reproduced-results.json
 ```

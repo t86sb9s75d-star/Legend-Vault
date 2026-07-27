@@ -1,0 +1,11 @@
+# Local, deterministic pre-commit hooks. No network-based security service is
+# used; the privacy scan runs entirely locally against tracked files.
+repos:
+  - repo: local
+    hooks:
+      - id: privacy-scan
+        name: privacy scan (tracked files, fail closed)
+        entry: python scripts/privacy_scan.py
+        language: system
+        pass_filenames: false
+        always_run: true

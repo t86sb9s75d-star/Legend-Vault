@@ -140,3 +140,56 @@ If real export content is committed (or reaches a remote):
    notify anyone who may have cloned or fetched.
 5. Record the incident (what, when, scope) in a private note — not in this repo.
 6. Add or tighten a guard/ignore so the same class of data cannot re-enter.
+
+## Redaction vs. history
+
+Editing or removing a value in the current working tree does **not** erase it
+from the repository's history. Earlier commits still contain the old content,
+and on a public repository that content has already been exposed and may be
+cloned, forked, cached, or mirrored.
+
+- **Current-tree redaction** (what a normal remediation PR does) stops the value
+  from appearing in the *latest* tree and prevents accidental re-use going
+  forward.
+- **History cleanup** (removing the value from *all* prior commits, e.g. with
+  `git filter-repo`) is a **separate, destructive, coordinated** operation. It
+  rewrites commit hashes, requires an authorized force-update, and must be
+  coordinated with everyone who has cloned or forked. It is decided and executed
+  on its own, after the redaction PR is merged — never bundled into it.
+
+## Correlatable identifiers
+
+A hash is not automatically safe to publish. The **SHA-256 of a real private
+export** is a stable fingerprint: anyone who holds the same export can confirm
+it matches this repository. Treat digests, receipts, and derived measurements of
+private source material as **correlatable identifiers**, not as anonymous
+metadata. Hashes of *public* source files (e.g. a source-code manifest) are fine
+because the files themselves are already public.
+
+## Synthetic fixtures
+
+Synthetic fixtures must be **invented**, never copied from a real export. Do not
+paste real filenames, digests, dates, counts, titles, or content into fixtures,
+tests, snapshots, or reports. If a report needs example numbers, label them
+clearly as synthetic; if it documents real-export measurements, state that they
+were removed and kept only in private audit records outside the repository.
+
+## Preventive scanning
+
+`scripts/privacy_scan.py` is a deterministic, offline, fail-closed scanner over
+**tracked files** (and text members of tracked ZIPs, inspected in memory). It
+runs in CI and as a local pre-commit hook, reports only `path:line: RULE-ID`
+(never the matched value), and exits non-zero on any finding. Rules:
+
+- `LV-PRIV-001` private-export-identifier (real-export archive names)
+- `LV-PRIV-002` private-export-digest (a full SHA-256 labeled as export/private)
+- `LV-PRIV-003` secret-pattern (private-key blocks, API-key/token shapes)
+- `LV-PRIV-004` personal-identifier (emails, account/user IDs with real values)
+- `LV-PRIV-005` local-private-path (local user home paths)
+- `LV-PRIV-006` raw-export-payload (known raw-export payload filenames)
+
+The scanner keeps a **narrow, documented allowlist** — only its own rule
+definitions (`scripts/privacy_scan.py`), its synthetic test fixtures
+(`tests/test_privacy_scan.py`), and `.gitignore` (which lists the very payload
+patterns being scanned for). The allowlist is intentionally small; widening it
+requires a clear, written justification.
