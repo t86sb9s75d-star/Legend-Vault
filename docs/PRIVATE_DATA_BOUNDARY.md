@@ -177,19 +177,72 @@ were removed and kept only in private audit records outside the repository.
 ## Preventive scanning
 
 `scripts/privacy_scan.py` is a deterministic, offline, fail-closed scanner over
-**tracked files** (and text members of tracked ZIPs, inspected in memory). It
-runs in CI and as a local pre-commit hook, reports only `path:line: RULE-ID`
-(never the matched value), and exits non-zero on any finding. Rules:
+**tracked files** (`git ls-files`, so the index — including staged additions —
+is what gets scanned). It runs in CI and as a local pre-commit hook, reports
+only `path:line: RULE-ID` (never the matched value), and exits non-zero on any
+finding. Rules:
 
 - `LV-PRIV-001` private-export-identifier (real-export archive names)
-- `LV-PRIV-002` private-export-digest (a full SHA-256 labeled as export/private)
+- `LV-PRIV-002` private-export-digest (a full SHA-256 near a source/export
+  digest label)
 - `LV-PRIV-003` secret-pattern (private-key blocks, API-key/token shapes)
 - `LV-PRIV-004` personal-identifier (emails, account/user IDs with real values)
 - `LV-PRIV-005` local-private-path (local user home paths)
 - `LV-PRIV-006` raw-export-payload (known raw-export payload filenames)
+- `LV-PRIV-007` unscannable-content (content that could not be fully inspected)
 
-The scanner keeps a **narrow, documented allowlist** — only its own rule
-definitions (`scripts/privacy_scan.py`), its synthetic test fixtures
-(`tests/test_privacy_scan.py`), and `.gitignore` (which lists the very payload
-patterns being scanned for). The allowlist is intentionally small; widening it
+### What "fail closed" means here
+
+The scanner never silently skips content. Anything it cannot read, decode,
+parse, or bound becomes an explicit `LV-PRIV-007` finding — an unscannable file
+fails the scan rather than passing by omission. If git itself cannot be queried,
+the scan exits non-zero instead of reporting success.
+
+### Encoding and binary handling
+
+Encoding is not trusted. Every byte stream is scanned through several text
+views — UTF-8 (lossy), Latin-1, and UTF-16 (LE/BE) when NUL bytes are present —
+so UTF-16 text, Latin-1 text, and ASCII embedded inside otherwise-binary content
+are all covered. There is no "looks binary, skip it" path.
+
+### Archive handling
+
+Archives are detected by extension **and** by signature, so a ZIP renamed to
+`.md` is still treated as an archive. Members are read **in memory and never
+extracted into the repository**. Nested archives are scanned recursively up to a
+depth limit; deeper nesting, malformed or encrypted archives, unreadable
+members, and oversized members are reported as `LV-PRIV-007`.
+
+### Names and symlinks
+
+A name is itself text that can leak, so path and archive-member names are
+scanned with the same rules (minus the local-path rule, which cannot apply to a
+repository-relative path). Name rules run even when content cannot be read, so a
+prohibited filename is caught regardless of the entry's state. Symlinks are
+never followed; the link's **target string** is scanned, which is what git
+stores and which catches a link pointing at a private location.
+
+### Allowlist philosophy
+
+Exemptions are **rule-scoped, never whole-file blanket trust**:
+
+| Path | Exempt from | Why |
+|---|---|---|
+| `scripts/privacy_scan.py` | all rules | it defines every rule pattern |
+| `tests/test_privacy_scan.py` | all rules | it exercises every rule with synthetic values |
+| `.gitignore` | `LV-PRIV-001`, `LV-PRIV-006` only | it lists the export/payload names it protects against — and is still scanned for secrets, personal identifiers, and local paths |
+
+The allowlist is intentionally tiny and is asserted by a test. Widening it
 requires a clear, written justification.
+
+### Known limits (do not overstate the guarantee)
+
+- Detection is **pattern- and context-based**. It cannot recognise an arbitrary
+  private value that carries no recognisable shape or nearby label.
+- `LV-PRIV-002` binds a digest to a label within a small line window. A digest
+  deliberately separated from any label by more than that window, or carrying no
+  label at all, is indistinguishable from a public hash and is not flagged.
+- Obfuscated forms (e.g. an address written as `name [at] example.com`) are not
+  matched; the false-positive cost of matching them is too high.
+- The scanner sees the **current tree only**. It cannot detect or remove values
+  that already exist in git history — see "Redaction vs. history" above.
