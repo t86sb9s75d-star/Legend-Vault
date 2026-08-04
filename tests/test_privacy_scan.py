@@ -935,6 +935,64 @@ def test_budget_failure_output_never_exposes_member_names() -> None:
     assert all(_FAKE_EMAIL not in r for r in rendered)
 
 
+
+# --- undecodable names must not crash output rendering ------------------------
+# Archive headers and filesystem names can carry lone surrogates
+# (surrogateescape). Strict UTF-8 encoding of those raises, and a crash in the
+# reporting path could emit an unsafe traceback.
+
+_SURROGATE = "\udcff"
+
+
+def test_safe_location_handles_surrogate_names() -> None:
+    rendered = safe_location(f"{_FAKE_EMAIL}-{_SURROGATE}.txt")
+    assert _FAKE_EMAIL not in rendered
+    assert "redacted-name:" in rendered
+
+
+def test_finding_str_handles_surrogate_names() -> None:
+    rendered = str(privacy_scan.Finding(f"{_FAKE_EMAIL}-{_SURROGATE}.txt", "LV-PRIV-004", 0))
+    assert _FAKE_EMAIL not in rendered
+    rendered.encode("utf-8")  # must be encodable, i.e. printable
+
+
+def test_safe_component_with_surrogate_is_still_printable() -> None:
+    rendered = safe_location(f"docs/notes-{_SURROGATE}.md")
+    rendered.encode("utf-8")
+    assert rendered.startswith("docs/")
+
+
+def test_line_digest_handles_surrogates() -> None:
+    assert len(privacy_scan._line_digest(f"x{_SURROGATE}y")) == 64
+
+
+def test_emit_degrades_instead_of_raising() -> None:
+    class _AsciiOnly(io.StringIO):
+        encoding = "ascii"
+
+        def write(self, text):
+            text.encode("ascii")  # raises on non-ASCII, like a strict stream
+            return super().write(text)
+
+    sink = _AsciiOnly()
+    privacy_scan._emit("caf\u00e9/<redacted-name:abc123>:0: LV-PRIV-004", stream=sink)
+    assert "LV-PRIV-004" in sink.getvalue()
+
+
+def test_scan_of_archive_with_undecodable_member_name_does_not_crash() -> None:
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tf:
+        payload = ("contact " + _FAKE_EMAIL).encode()
+        info = tarfile.TarInfo(f"bad-{_SURROGATE}-{_FAKE_EMAIL}.txt")
+        info.size = len(payload)
+        tf.addfile(info, io.BytesIO(payload))
+    rendered = [str(f) for f in scan_archive("b.tar", buf.getvalue(), kind="tar")]
+    assert rendered
+    for line in rendered:
+        line.encode("utf-8")
+        assert _FAKE_EMAIL not in line
+
+
 _TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
 
 

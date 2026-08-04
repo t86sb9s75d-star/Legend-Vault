@@ -172,8 +172,27 @@ _CONTENT_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
 _LINE_EXEMPTIONS: dict[tuple[str, str, str], str] = {}
 
 
+def _encode_total(text: str) -> bytes:
+    """Encode to bytes without ever raising.
+
+    Names taken from archive headers or the filesystem can carry lone surrogates
+    (``os.fsdecode`` / tar header decoding use ``surrogateescape``). Strict UTF-8
+    encoding raises on those, which would crash output rendering — the one place
+    that must never fail, since a crash could print an unsafe traceback.
+    """
+    try:
+        return text.encode("utf-8", errors="surrogatepass")
+    except UnicodeEncodeError:  # pragma: no cover - belt and braces
+        return text.encode("utf-8", errors="backslashreplace")
+
+
+def _printable(text: str) -> str:
+    """A form of ``text`` that is safe to write to stdout/stderr."""
+    return _encode_total(text).decode("utf-8", errors="replace")
+
+
 def _line_digest(line: str) -> str:
-    return hashlib.sha256(line.strip().encode("utf-8")).hexdigest()
+    return hashlib.sha256(_encode_total(line.strip())).hexdigest()
 
 
 def _register_exemption(path: str, rule_id: str, line: str, reason: str) -> None:
@@ -244,10 +263,12 @@ def safe_location(location: str) -> str:
         parts = []
         for component in chunk.split("/"):
             if _component_is_unsafe(component):
-                digest = hashlib.sha256(component.encode("utf-8")).hexdigest()[:12]
+                digest = hashlib.sha256(_encode_total(component)).hexdigest()[:12]
                 parts.append(f"<redacted-name:{digest}>")
             else:
-                parts.append(component)
+                # Safe components are preserved, but still normalised so an
+                # undecodable byte cannot crash the caller that prints them.
+                parts.append(_printable(component))
         rendered.append("/".join(parts))
     return "!".join(rendered)
 
@@ -697,6 +718,17 @@ def scan_repository() -> list[Finding]:
     return findings
 
 
+def _emit(line: str, *, stream=None) -> None:
+    """Write a finding line, degrading gracefully if the stream's encoding
+    cannot represent a character. Reporting must never raise."""
+    target = stream or sys.stdout
+    try:
+        print(line, file=target)
+    except UnicodeEncodeError:  # pragma: no cover - locale-dependent
+        encoding = getattr(target, "encoding", None) or "ascii"
+        print(line.encode(encoding, errors="backslashreplace").decode(encoding), file=target)
+
+
 def main() -> int:
     try:
         findings = scan_repository()
@@ -707,7 +739,7 @@ def main() -> int:
         return 2
     unique = sorted(set(findings), key=lambda x: (x.path, x.line, x.rule_id))
     for f in unique:
-        print(str(f))
+        _emit(str(f))
     if unique:
         print(
             f"\nPRIVACY SCAN FAILED: {len(unique)} finding(s). "
