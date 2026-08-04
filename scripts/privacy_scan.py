@@ -398,38 +398,95 @@ def detect_archive(data: bytes, name: str = "") -> str | None:
     return None
 
 
-def _take_budget(budget: list[int], declared: int, limit: int) -> bool:
-    """True when ``declared`` bytes may be read within both the per-member limit
-    and the shared total budget. Never lets the budget go negative."""
-    return declared <= limit and 0 < budget[0] and declared <= budget[0]
+class Budget:
+    """Debit-on-consumption accounting for **expanded bytes inspected**.
+
+    The metric is decompressed/extracted output that the scanner reads, charged
+    at the moment it is consumed — never after a validation succeeds. Bytes read
+    from content that is subsequently rejected, oversized, malformed, or
+    unreadable are charged all the same, so a crafted archive cannot obtain free
+    reads by repeatedly failing. One instance is shared through every nested
+    container. Compressed input bytes are not charged separately; each expansion
+    level is charged once, as it is expanded.
+
+    **Exact guarantee.** Total consumption across a whole scan is at most
+    ``_MAX_TOTAL_BYTES + 1``. The single extra byte is the sentinel that
+    distinguishes "exactly at the limit" from "over the limit" on the final
+    read; because it is charged like any other byte, the budget then reads as
+    exhausted and every later member gets a zero allowance and is never read.
+    The overshoot is therefore constant, not per member — verified against
+    archives with 1 to 200 malicious members.
+    """
+
+    __slots__ = ("remaining", "consumed")
+
+    def __init__(self, total: int) -> None:
+        self.remaining = max(0, total)
+        self.consumed = 0
+
+    def charge(self, count: int) -> None:
+        count = max(0, count)
+        self.consumed += count
+        self.remaining = max(0, self.remaining - count)  # never negative
+
+    @property
+    def exhausted(self) -> bool:
+        return self.remaining <= 0
+
+    def allowance(self, per_member_limit: int) -> int:
+        """Bytes this member may consume: the smaller of the per-member limit
+        and what is left of the shared total."""
+        return max(0, min(per_member_limit, self.remaining))
 
 
-def _decompress_bounded(raw: bytes, kind: str, budget: list[int]) -> bytes | None:
-    """Decompress a single-stream container, never producing more than the
-    remaining budget allows. ``None`` signals unscannable."""
-    limit = min(_MAX_MEMBER_BYTES, max(budget[0], 0))
-    if limit <= 0:
-        return None
+def _read_charged(stream, budget: Budget, per_member_limit: int) -> tuple[bytes, bool]:
+    """The single bounded-read helper every archive path must use.
+
+    Reads at most ``allowance + 1`` bytes (the extra byte detects overflow) and
+    charges **everything actually read** to ``budget`` before any decision is
+    taken. Returns ``(data, overflowed)``; on overflow the data is discarded but
+    the consumption still stands. A failure mid-read charges the full allowance
+    pessimistically, so an exception can never restore capacity.
+    """
+    allowance = budget.allowance(per_member_limit)
+    if allowance <= 0:
+        return b"", True
+    try:
+        chunk = stream.read(allowance + 1)
+    except Exception:
+        budget.charge(allowance)
+        return b"", True
+    budget.charge(len(chunk))  # charged before the overflow branch
+    if len(chunk) > allowance:
+        return b"", True
+    return chunk, False
+
+
+def _decompress_charged(raw: bytes, kind: str, budget: Budget) -> bytes | None:
+    """Decompress a single-stream container through the charged reader.
+
+    ``None`` signals unscannable. Decompressors carry no declared size, so this
+    is the path where an unbounded expansion would otherwise occur; every byte
+    produced is charged, including on the overflow path.
+    """
     stream = io.BytesIO(raw)
     try:
         # Each stdlib wrapper takes its source differently; only gzip uses
-        # `fileobj`. Reading limit+1 bounds decompression regardless of the
-        # declared or actual expanded size.
+        # `fileobj`.
         if kind == "gzip":
-            with gzip.GzipFile(fileobj=stream) as fh:
-                out = fh.read(limit + 1)
+            handle = gzip.GzipFile(fileobj=stream)
         elif kind == "bzip2":
-            with bz2.BZ2File(stream) as fh:
-                out = fh.read(limit + 1)
+            handle = bz2.BZ2File(stream)
         else:
-            with lzma.LZMAFile(stream) as fh:
-                out = fh.read(limit + 1)
+            handle = lzma.LZMAFile(stream)
     except Exception:
         return None
-    if len(out) > limit:
+    try:
+        with handle:
+            data, overflowed = _read_charged(handle, budget, _MAX_MEMBER_BYTES)
+    except Exception:
         return None
-    budget[0] -= len(out)
-    return out
+    return None if overflowed else data
 
 
 def scan_archive(
@@ -437,16 +494,17 @@ def scan_archive(
     data: bytes,
     *,
     depth: int = 1,
-    budget: list[int] | None = None,
+    budget: Budget | None = None,
     kind: str | None = None,
 ) -> list[Finding]:
     """Scan an archive's contents from memory. Recurses into nested archives.
 
     Never extracts to disk. Any member that cannot be read, or that would exceed
-    a bound, becomes an LV-PRIV-007 finding rather than a silent gap.
+    a bound, becomes an LV-PRIV-007 finding rather than a silent gap. All nested
+    containers share one :class:`Budget`, charged as bytes are consumed.
     """
     if budget is None:
-        budget = [_MAX_TOTAL_BYTES]
+        budget = Budget(_MAX_TOTAL_BYTES)
     if depth > _MAX_ARCHIVE_DEPTH:
         return [Finding(display_path, "LV-PRIV-007", 0, note="max archive depth")]
 
@@ -461,7 +519,7 @@ def scan_archive(
 
 
 def _scan_member(
-    member_display: str, data: bytes, depth: int, budget: list[int]
+    member_display: str, data: bytes, depth: int, budget: Budget
 ) -> list[Finding]:
     """Scan one extracted member: recurse if it is itself an archive."""
     kind = detect_archive(data, member_display)
@@ -472,7 +530,7 @@ def _scan_member(
     return scan_bytes(member_display, data)
 
 
-def _scan_zip(display_path: str, data: bytes, depth: int, budget: list[int]) -> list[Finding]:
+def _scan_zip(display_path: str, data: bytes, depth: int, budget: Budget) -> list[Finding]:
     findings: list[Finding] = []
     try:
         zf = zipfile.ZipFile(io.BytesIO(data))
@@ -486,29 +544,34 @@ def _scan_zip(display_path: str, data: bytes, depth: int, budget: list[int]) -> 
             findings.extend(
                 Finding(member_display, rid, 0) for rid in rules_for_name(info.filename)
             )
-            if not _take_budget(budget, info.file_size, _MAX_MEMBER_BYTES):
-                findings.append(Finding(member_display, "LV-PRIV-007", 0, note="over budget"))
+            if budget.exhausted:
+                # Stop expanding once the shared total is spent; the archive is
+                # reported unscannable rather than partially trusted.
+                findings.append(Finding(display_path, "LV-PRIV-007", 0, note="budget exhausted"))
+                break
+            # The declared size is only a preflight signal; actual consumption
+            # is authoritative and is charged by _read_charged.
+            if info.file_size > _MAX_MEMBER_BYTES:
+                findings.append(Finding(member_display, "LV-PRIV-007", 0, note="declared oversize"))
                 continue
-            limit = min(_MAX_MEMBER_BYTES, budget[0])
             try:
-                with zf.open(info) as fh:
-                    member = fh.read(limit + 1)
+                handle = zf.open(info)
             except Exception:
                 findings.append(Finding(member_display, "LV-PRIV-007", 0, note="unreadable"))
                 continue
-            if len(member) > limit:
-                # Declared size understated the real payload.
-                findings.append(Finding(member_display, "LV-PRIV-007", 0, note="size mismatch"))
+            with handle:
+                member, overflowed = _read_charged(handle, budget, _MAX_MEMBER_BYTES)
+            if overflowed:
+                findings.append(Finding(member_display, "LV-PRIV-007", 0, note="over budget"))
                 continue
-            budget[0] -= len(member)
             findings.extend(_scan_member(member_display, member, depth, budget))
     return findings
 
 
-def _scan_tar(display_path: str, data: bytes, depth: int, budget: list[int]) -> list[Finding]:
+def _scan_tar(display_path: str, data: bytes, depth: int, budget: Budget) -> list[Finding]:
     findings: list[Finding] = []
     try:
-        tf = tarfile.open(fileobj=io.BytesIO(data), mode="r:*")
+        tf = tarfile.open(fileobj=io.BytesIO(data), mode="r:")
     except Exception:
         return [Finding(display_path, "LV-PRIV-007", 0, note="malformed tar")]
     with tf:
@@ -527,28 +590,32 @@ def _scan_tar(display_path: str, data: bytes, depth: int, budget: list[int]) -> 
             findings.extend(
                 Finding(member_display, rid, 0) for rid in rules_for_name(info.name)
             )
-            if not _take_budget(budget, info.size, _MAX_MEMBER_BYTES):
-                findings.append(Finding(member_display, "LV-PRIV-007", 0, note="over budget"))
+            if budget.exhausted:
+                findings.append(Finding(display_path, "LV-PRIV-007", 0, note="budget exhausted"))
+                break
+            if info.size > _MAX_MEMBER_BYTES:
+                findings.append(Finding(member_display, "LV-PRIV-007", 0, note="declared oversize"))
                 continue
-            limit = min(_MAX_MEMBER_BYTES, budget[0])
             try:
                 fh = tf.extractfile(info)
-                member = fh.read(limit + 1) if fh is not None else b""
             except Exception:
                 findings.append(Finding(member_display, "LV-PRIV-007", 0, note="unreadable"))
                 continue
-            if len(member) > limit:
-                findings.append(Finding(member_display, "LV-PRIV-007", 0, note="size mismatch"))
+            if fh is None:
                 continue
-            budget[0] -= len(member)
+            with fh:
+                member, overflowed = _read_charged(fh, budget, _MAX_MEMBER_BYTES)
+            if overflowed:
+                findings.append(Finding(member_display, "LV-PRIV-007", 0, note="over budget"))
+                continue
             findings.extend(_scan_member(member_display, member, depth, budget))
     return findings
 
 
 def _scan_single_stream(
-    display_path: str, data: bytes, kind: str, depth: int, budget: list[int]
+    display_path: str, data: bytes, kind: str, depth: int, budget: Budget
 ) -> list[Finding]:
-    inner = _decompress_bounded(data, kind, budget)
+    inner = _decompress_charged(data, kind, budget)
     if inner is None:
         return [Finding(display_path, "LV-PRIV-007", 0, note=f"undecompressable {kind}")]
     member_display = f"{display_path}!<{kind}-stream>"

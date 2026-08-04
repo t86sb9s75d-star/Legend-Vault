@@ -666,7 +666,11 @@ def test_total_budget_is_enforced_before_decompression() -> None:
         findings, read_bytes = _counted_scan(buf.getvalue())
     finally:
         _restore_budget(saved)
-    assert read_bytes <= 1000, read_bytes          # never over-read
+    # Bound is total + 1: the single sentinel byte that distinguishes "exactly
+    # at the limit" from "over the limit" on the final read. It is charged like
+    # any other byte, so it cannot recur per member (see
+    # test_repeated_overflow_cannot_accumulate_consumption).
+    assert read_bytes <= 1001, read_bytes
     assert "LV-PRIV-007" in _ids(findings)          # and it fails closed
 
 
@@ -696,7 +700,7 @@ def test_nested_archives_share_one_total_budget() -> None:
         findings, read_bytes = _counted_scan(buf.getvalue())
     finally:
         _restore_budget(saved)
-    assert read_bytes <= 500 + 450, read_bytes
+    assert read_bytes <= 500 + 1, read_bytes
     assert "LV-PRIV-007" in _ids(findings)
 
 
@@ -709,7 +713,7 @@ def test_high_expansion_ratio_member_is_bounded() -> None:
         findings, read_bytes = _counted_scan(buf.getvalue())
     finally:
         _restore_budget(saved)
-    assert read_bytes <= 5_000, read_bytes
+    assert read_bytes <= 5_001, read_bytes
     assert "LV-PRIV-007" in _ids(findings)
 
 
@@ -722,6 +726,211 @@ def test_budget_failure_output_is_safe() -> None:
         rendered = [str(f) for f in scan_archive("z.zip", buf.getvalue())]
     finally:
         _restore_budget(saved)
+    assert rendered
+    assert all(_FAKE_EMAIL not in r for r in rendered)
+
+
+
+# --- resource accounting: debit-on-consumption --------------------------------
+# These measure the ACTUAL number of decompressed bytes read, not the budget
+# variable, because the defect they guard against was that the variable did not
+# reflect real consumption.
+
+
+class _CountingReader(io.RawIOBase):
+    def __init__(self, inner, counter):
+        self._inner = inner
+        self._counter = counter
+
+    def read(self, size=-1):
+        chunk = self._inner.read(size)
+        self._counter["n"] += len(chunk)
+        return chunk
+
+    def readable(self):
+        return True
+
+
+def _measure_consumption(data: bytes, total: int, member: int, kind: str | None = None):
+    """Scan an archive under shrunken bounds, counting every decompressed byte."""
+    counter = {"n": 0}
+    real_zip_open = zipfile.ZipFile.open
+    real_tar_extract = tarfile.TarFile.extractfile
+    real_gzip_read = gzip.GzipFile.read
+    real_bz2_read = bz2.BZ2File.read
+    real_lzma_read = lzma.LZMAFile.read
+    saved = (privacy_scan._MAX_TOTAL_BYTES, privacy_scan._MAX_MEMBER_BYTES)
+    privacy_scan._MAX_TOTAL_BYTES, privacy_scan._MAX_MEMBER_BYTES = total, member
+
+    def zip_open(self, name, mode="r", pwd=None, **kw):
+        return _CountingReader(real_zip_open(self, name, mode, pwd, **kw), counter)
+
+    def tar_extract(self, m):
+        got = real_tar_extract(self, m)
+        return _CountingReader(got, counter) if got is not None else None
+
+    def counted(real):
+        def _read(self, size=-1):
+            out = real(self, size)
+            counter["n"] += len(out)
+            return out
+        return _read
+
+    zipfile.ZipFile.open = zip_open
+    tarfile.TarFile.extractfile = tar_extract
+    gzip.GzipFile.read = counted(real_gzip_read)
+    bz2.BZ2File.read = counted(real_bz2_read)
+    lzma.LZMAFile.read = counted(real_lzma_read)
+    try:
+        findings = scan_archive("probe.bin", data, kind=kind)
+    finally:
+        zipfile.ZipFile.open = real_zip_open
+        tarfile.TarFile.extractfile = real_tar_extract
+        gzip.GzipFile.read = real_gzip_read
+        bz2.BZ2File.read = real_bz2_read
+        lzma.LZMAFile.read = real_lzma_read
+        privacy_scan._MAX_TOTAL_BYTES, privacy_scan._MAX_MEMBER_BYTES = saved
+    return findings, counter["n"]
+
+
+def _zip_of_gz_members(count: int, payload: int) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        for i in range(count):
+            zf.writestr(f"m{i}.gz", gzip.compress(b"A" * payload))
+    return buf.getvalue()
+
+
+def test_single_stream_overflow_is_charged() -> None:
+    # The reachable case: decompressors carry no declared size. Before the fix
+    # this consumed limit+1 per member without ever debiting.
+    findings, consumed = _measure_consumption(_zip_of_gz_members(1, 5_000), 2_000, 1_000)
+    assert consumed <= 2_001, consumed
+    assert "LV-PRIV-007" in _ids(findings)
+
+
+def test_repeated_overflow_cannot_accumulate_consumption() -> None:
+    # The headline defect: many understated members must not each get a fresh
+    # uncharged read. Consumption must stay flat as member count grows.
+    measurements = [
+        _measure_consumption(_zip_of_gz_members(n, 5_000), 2_000, 1_000)[1]
+        for n in (1, 5, 40)
+    ]
+    assert all(c <= 2_001 for c in measurements), measurements
+    assert measurements[-1] == measurements[-2], measurements  # flat, not growing
+
+
+def test_zip_size_mismatch_branch_charges_bytes_read() -> None:
+    # Structurally identical accounting path in the ZIP walker.
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("a.txt", "A" * 4_000)
+        zf.writestr("b.txt", "B" * 4_000)
+    findings, consumed = _measure_consumption(buf.getvalue(), 1_000, 3_000)
+    assert consumed <= 1_001, consumed
+    assert "LV-PRIV-007" in _ids(findings)
+
+
+def test_tar_size_mismatch_branch_charges_bytes_read() -> None:
+    findings, consumed = _measure_consumption(
+        _tar_bytes("m.txt", b"A" * 4_000), 1_000, 3_000, kind="tar"
+    )
+    assert consumed <= 1_001, consumed
+    assert "LV-PRIV-007" in _ids(findings)
+
+
+def test_nested_containers_share_one_consumption_budget() -> None:
+    inner = _zip_of_gz_members(4, 4_000)
+    outer = io.BytesIO()
+    with zipfile.ZipFile(outer, "w") as zf:
+        zf.writestr("inner.zip", inner)
+    findings, consumed = _measure_consumption(outer.getvalue(), 2_000, 50_000)
+    assert consumed <= 2_001, consumed
+
+
+def test_failed_member_then_another_member_stays_within_total() -> None:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("big.gz", gzip.compress(b"A" * 9_000))
+        zf.writestr("later.txt", "contact " + _FAKE_EMAIL)
+    findings, consumed = _measure_consumption(buf.getvalue(), 1_500, 1_200)
+    assert consumed <= 1_501, consumed
+    assert "LV-PRIV-007" in _ids(findings)
+
+
+def test_member_exactly_at_remaining_limit_succeeds() -> None:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("m.txt", "contact " + _FAKE_EMAIL)
+    size = len("contact " + _FAKE_EMAIL)
+    findings, _ = _measure_consumption(buf.getvalue(), size, size)
+    assert "LV-PRIV-004" in _ids(findings)
+    assert "LV-PRIV-007" not in _ids(findings)
+
+
+def test_member_one_byte_above_remaining_limit_fails_closed() -> None:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("m.txt", "contact " + _FAKE_EMAIL)
+    size = len("contact " + _FAKE_EMAIL)
+    findings, _ = _measure_consumption(buf.getvalue(), size - 1, size - 1)
+    assert "LV-PRIV-007" in _ids(findings)
+
+
+def test_exception_after_partial_read_cannot_restore_capacity() -> None:
+    budget = privacy_scan.Budget(100)
+
+    class _Exploding(io.RawIOBase):
+        def read(self, size=-1):
+            raise OSError("boom")
+
+    data, overflowed = privacy_scan._read_charged(_Exploding(), budget, 100)
+    assert data == b"" and overflowed
+    assert budget.consumed == 100          # charged pessimistically
+    assert budget.remaining == 0
+
+
+def test_budget_never_becomes_negative() -> None:
+    budget = privacy_scan.Budget(10)
+    budget.charge(50)
+    assert budget.remaining == 0
+    budget.charge(-5)                      # nonsense input cannot credit back
+    assert budget.remaining == 0
+    assert budget.exhausted
+
+
+def test_exhausted_budget_grants_no_allowance() -> None:
+    budget = privacy_scan.Budget(0)
+    assert budget.allowance(1_000) == 0
+    data, overflowed = privacy_scan._read_charged(io.BytesIO(b"A" * 100), budget, 1_000)
+    assert data == b"" and overflowed
+    assert budget.consumed == 0            # nothing was read at all
+
+
+def test_safe_archive_under_the_limit_still_scans() -> None:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("ok.txt", "contact " + _FAKE_EMAIL)
+    findings, consumed = _measure_consumption(buf.getvalue(), 10_000, 10_000)
+    assert "LV-PRIV-004" in _ids(findings)
+    assert "LV-PRIV-007" not in _ids(findings)
+    assert consumed < 10_000
+
+
+def test_consumption_accounting_is_deterministic() -> None:
+    data = _zip_of_gz_members(6, 4_000)
+    first = _measure_consumption(data, 2_000, 1_000)
+    second = _measure_consumption(data, 2_000, 1_000)
+    assert first[1] == second[1]
+    assert sorted(str(f) for f in first[0]) == sorted(str(f) for f in second[0])
+
+
+def test_budget_failure_output_never_exposes_member_names() -> None:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr(f"{_FAKE_EMAIL}.gz", gzip.compress(b"A" * 9_000))
+    findings, _ = _measure_consumption(buf.getvalue(), 1_000, 800)
+    rendered = [str(f) for f in findings]
     assert rendered
     assert all(_FAKE_EMAIL not in r for r in rendered)
 

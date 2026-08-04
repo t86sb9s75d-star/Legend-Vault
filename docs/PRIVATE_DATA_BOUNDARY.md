@@ -225,10 +225,30 @@ through as ordinary bytes:
 Detection is by **signature first, extension second**, so an archive renamed to
 `.md` is still treated as an archive, and a prose file merely *named* like an
 archive is not. Members are read **in memory and never extracted** to disk or
-into the repository. Nested archives are followed to a bounded depth and share
-one total byte budget, which is checked **before** each member is decompressed;
-reads are bounded so a member whose header understates its real size cannot
-exceed the budget.
+into the repository. Nested archives are followed to a bounded depth.
+
+#### Resource accounting is debit-on-consumption
+
+The byte budget measures **expanded bytes inspected** — decompressed or
+extracted output the scanner actually reads. Every read goes through one helper
+that charges the shared budget **at the moment bytes are consumed**, before any
+validation decision. Bytes read from content that is then rejected as oversized,
+malformed, unreadable, or otherwise `LV-PRIV-007` are charged exactly the same,
+so a crafted archive cannot obtain free reads by failing repeatedly. A read that
+raises mid-way is charged its full allowance, so an exception cannot restore
+capacity. A declared member size is treated only as a preflight signal; actual
+consumption is authoritative. When the shared budget is exhausted the containing
+archive scan stops and is reported `LV-PRIV-007` rather than partially trusted.
+
+**Exact guarantee:** total consumption across a scan is at most
+`_MAX_TOTAL_BYTES + 1`. The single extra byte is the sentinel that distinguishes
+"exactly at the limit" from "over the limit" on the final read; it is charged
+like any other byte, so the overshoot is a constant, not per member — verified
+against archives holding 1 to 200 malicious members. Compressed input bytes are
+not charged separately; each expansion level is charged once as it expands, so
+a nested member is charged at each level it is expanded through. The tracked
+file's own bytes are read from disk under the per-file size cap and are not part
+of this budget.
 
 ### Names, symlinks, and safe output
 
