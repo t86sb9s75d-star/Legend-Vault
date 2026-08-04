@@ -13,26 +13,32 @@ Design guarantees
 -----------------
 - Operates on **tracked files only** (``git ls-files``).
 - Reads locally; never uploads content and never calls a network service.
-- **Never silently skips content.** Anything that cannot be decoded, parsed, or
-  read becomes an explicit ``LV-PRIV-007`` finding rather than a gap. Encoding
-  is not trusted: every byte stream is scanned through several text views
-  (UTF-8, Latin-1, and UTF-16 when NUL bytes are present), so UTF-16 text,
-  Latin-1 text, and ASCII embedded inside binary blobs are all covered.
-- **Recurses into nested archives** up to ``_MAX_ARCHIVE_DEPTH``; deeper nesting
-  is reported as unscannable instead of ignored.
-- Reports only ``path:line: RULE-ID`` — never the matched value.
-- Exits non-zero (fail closed) if any finding is present.
+- **Never silently skips content.** Anything that cannot be decoded, parsed,
+  read, or bounded becomes an explicit ``LV-PRIV-007`` finding rather than a
+  gap. Encoding is not trusted: byte streams are scanned through several text
+  views (UTF-8, Latin-1, and UTF-16/UTF-32 when NUL patterns indicate them).
+- **Recognised archive formats are inspected or rejected, never treated as
+  ordinary bytes.** ZIP/TAR/GZIP/BZIP2/XZ are inspected in memory; formats that
+  cannot be inspected without new dependencies (7z, RAR) yield ``LV-PRIV-007``.
+- **Output never reproduces a prohibited value** — not in file paths, directory
+  components, or archive member names. Unsafe components are replaced with a
+  stable ``<redacted-name:digest>`` marker so remediation is still possible.
+- **No file is exempt from every rule.** Exemptions are line-scoped and
+  alteration-sensitive (see ``_LINE_EXEMPTIONS``).
 - Deterministic: fixed rule order, sorted output, no environment input.
 
 Deliberate limits (documented, not hidden)
 ------------------------------------------
-- Detection is pattern-based. It cannot recognise an arbitrary private value
-  that carries no recognisable shape or label.
-- Very large members are bounded by ``_MAX_MEMBER_BYTES`` /
-  ``_MAX_TOTAL_BYTES``; exceeding a bound yields ``LV-PRIV-007`` (fail closed),
-  not a silent skip.
-- Symlinks are never followed. A tracked symlink's *target string* is scanned
-  (that is what git stores), so a link pointing at a private location is caught.
+- Detection is pattern- and context-based. It cannot recognise an arbitrary
+  private value that carries no recognisable shape or nearby label.
+- ``LV-PRIV-002`` binds a digest to a label within ``_DIGEST_WINDOW`` lines. A
+  digest deliberately separated further, or carrying no label at all, is
+  indistinguishable from a public hash and is not flagged.
+- Obfuscated forms (e.g. an address written as ``name [at] example.com``) are
+  not matched; the false-positive cost is too high.
+- Supported text encodings are exactly: UTF-8, Latin-1, UTF-16 LE/BE, UTF-32
+  LE/BE. Other multibyte encodings are not decoded (their ASCII substrings are
+  still visible through the Latin-1 view).
 - The scanner sees the **current tree only**. It cannot remove values that
   already exist in git history; see docs/PRIVATE_DATA_BOUNDARY.md.
 
@@ -48,46 +54,34 @@ Rules
 - ``LV-PRIV-005`` local-private-path — local user home paths.
 - ``LV-PRIV-006`` raw-export-payload — known raw-export payload filenames.
 - ``LV-PRIV-007`` unscannable-content — content that could not be fully
-  inspected (unreadable, undecodable, malformed/encrypted archive, too large,
-  or nested too deeply). Fail-closed: unscannable is treated as a finding.
+  inspected (unreadable, undecodable, malformed/encrypted/unsupported archive,
+  too large, or nested too deeply). Fail-closed: unscannable is a finding.
 """
 
 from __future__ import annotations
 
+import bz2
+import gzip
+import hashlib
 import io
+import lzma
 import re
 import subprocess
 import sys
+import tarfile
 import zipfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
-ALL_RULES: frozenset[str] = frozenset(
-    {
-        "LV-PRIV-001",
-        "LV-PRIV-002",
-        "LV-PRIV-003",
-        "LV-PRIV-004",
-        "LV-PRIV-005",
-        "LV-PRIV-006",
-        "LV-PRIV-007",
-    }
+ALL_RULES: tuple[str, ...] = (
+    "LV-PRIV-001",
+    "LV-PRIV-002",
+    "LV-PRIV-003",
+    "LV-PRIV-004",
+    "LV-PRIV-005",
+    "LV-PRIV-006",
+    "LV-PRIV-007",
 )
-
-# --- Allowlist (narrow, rule-scoped, documented) ------------------------------
-# Exemptions are per rule, never whole-file blanket trust:
-#   * scripts/privacy_scan.py     — defines every rule pattern, so it necessarily
-#                                   contains rule-shaped text.
-#   * tests/test_privacy_scan.py  — exercises every rule with synthetic values.
-#   * .gitignore                  — lists the raw-export payload/archive names it
-#                                   protects against; exempt ONLY from those two
-#                                   name rules, still scanned for secrets,
-#                                   personal identifiers, and local paths.
-ALLOWLIST: dict[str, frozenset[str]] = {
-    "scripts/privacy_scan.py": ALL_RULES,
-    "tests/test_privacy_scan.py": ALL_RULES,
-    ".gitignore": frozenset({"LV-PRIV-001", "LV-PRIV-006"}),
-}
 
 # --- Bounds -------------------------------------------------------------------
 _MAX_ARCHIVE_DEPTH = 3
@@ -124,10 +118,7 @@ _DIGEST_CONTEXT = re.compile(
 
 # Secrets: private-key blocks and common token shapes.
 _SECRET = re.compile(
-    # Key blocks, incl. "PRIVATE KEY BLOCK" (PGP) and typed keys (RSA/OPENSSH).
     r"-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY(?:[ A-Z]+)?-----"
-    # Provider tokens. The body charset allows '-' and '_' so segmented keys
-    # (sk-ant-…, sk-proj-…) are covered, not just single alphanumeric runs.
     r"|\bsk-[A-Za-z0-9_-]{20,}"
     r"|\bgh[pousr]_[A-Za-z0-9]{30,}"
     r"|\bgithub_pat_[A-Za-z0-9_]{20,}"
@@ -170,21 +161,118 @@ _CONTENT_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("LV-PRIV-005", _LOCAL_PATH_WIN),
 )
 
+# --- Exemptions ---------------------------------------------------------------
+# No file is exempt from every rule. An exemption is keyed by
+# (tracked path, rule id, sha256 of the stripped source line) and therefore:
+#   * covers one rule on one exact line, not a file;
+#   * is alteration-sensitive — edit the line and the exemption stops applying,
+#     so neighbouring text can never inherit trust;
+#   * carries an explicit written reason.
+# Name-derived findings (line 0) can never be exempted.
+_LINE_EXEMPTIONS: dict[tuple[str, str, str], str] = {}
+
+
+def _line_digest(line: str) -> str:
+    return hashlib.sha256(line.strip().encode("utf-8")).hexdigest()
+
+
+def _register_exemption(path: str, rule_id: str, line: str, reason: str) -> None:
+    _LINE_EXEMPTIONS[(path, rule_id, _line_digest(line))] = reason
+
+
+# `.gitignore` must literally name the export archives it excludes, so those
+# exact lines cannot avoid LV-PRIV-001. They are the only exemptions in the
+# repository: three individual lines, one rule, each alteration-sensitive.
+#
+# The fragments below are joined at runtime so this source file does not itself
+# contain a contiguous export-archive name — the scanner therefore needs no
+# exemption for its own rule definitions.
+for _head, _tail in (
+    ("*.chatgpt-ex", "port.zip"),
+    ("chatgpt-ex", "port*.zip"),
+    ("LegendVault_RawRec", "ord*.zip"),
+):
+    _register_exemption(
+        ".gitignore",
+        "LV-PRIV-001",
+        _head + _tail,
+        "protective ignore pattern that must name the export archive it excludes",
+    )
+
+
+def _is_exempt(path: str, rule_id: str, line_text: str) -> bool:
+    return (path, rule_id, _line_digest(line_text)) in _LINE_EXEMPTIONS
+
+
+def exemptions() -> dict[str, set[str]]:
+    """Public view of what is exempt, for inspection and tests: path -> rules.
+
+    Every entry is line-scoped; this collapses them to the rules touched so a
+    test can assert that no path is exempt from every rule.
+    """
+    summary: dict[str, set[str]] = {}
+    for path, rule_id, _digest in _LINE_EXEMPTIONS:
+        summary.setdefault(path, set()).add(rule_id)
+    return summary
+
+
+def exemption_reasons() -> dict[tuple[str, str, str], str]:
+    """Every exemption with its written reason (documented narrowness)."""
+    return dict(_LINE_EXEMPTIONS)
+
+
+# --- Safe output rendering ----------------------------------------------------
+
+
+def _component_is_unsafe(component: str) -> bool:
+    if not component:
+        return False
+    if _PAYLOAD_NAME.match(component):
+        # A payload filename is a category, not a private value; keep it legible.
+        return False
+    return bool(rules_for_line(component)) or bool(
+        _HEX64.search(component) and _DIGEST_CONTEXT.search(component)
+    )
+
+
+def safe_location(location: str) -> str:
+    """Render a path / archive-member location without reproducing a prohibited
+    value. Safe components are preserved; an unsafe component is replaced by a
+    stable one-way marker so the entry remains identifiable for remediation."""
+    rendered: list[str] = []
+    for chunk in location.split("!"):
+        parts = []
+        for component in chunk.split("/"):
+            if _component_is_unsafe(component):
+                digest = hashlib.sha256(component.encode("utf-8")).hexdigest()[:12]
+                parts.append(f"<redacted-name:{digest}>")
+            else:
+                parts.append(component)
+        rendered.append("/".join(parts))
+    return "!".join(rendered)
+
 
 @dataclass(frozen=True)
 class Finding:
     path: str
     rule_id: str
     line: int
+    # Excluded from equality so identical findings still de-duplicate.
+    note: str = field(default="", compare=False)
+
+    @property
+    def safe_path(self) -> str:
+        return safe_location(self.path)
 
     def __str__(self) -> str:
-        # Only location + rule; never the matched value.
-        return f"{self.path}:{self.line}: {self.rule_id}"
+        # Location + rule only, with unsafe name components redacted.
+        return f"{self.safe_path}:{self.line}: {self.rule_id}"
 
 
 def rules_for_line(line: str) -> list[str]:
-    """Single-line rules. LV-PRIV-002 needs surrounding context; see scan_text."""
-    hits = []
+    """Single-line content rules. LV-PRIV-002 needs surrounding context and is
+    applied by scan_text (and, for names, via the single-line degenerate case)."""
+    hits: list[str] = []
     for rid, rx in _CONTENT_RULES:
         if rid not in hits and rx.search(line):
             hits.append(rid)
@@ -192,47 +280,52 @@ def rules_for_line(line: str) -> list[str]:
 
 
 def rules_for_name(name: str) -> list[str]:
-    """Rules evaluated against a path/member name.
+    """Rules evaluated against a path / archive-member name.
 
-    A name is itself text that can leak (an export archive name, an email, a
-    payload filename), so the content rules are applied to it too — except
-    LV-PRIV-005, because a tracked path is always repository-relative and can
-    never be a local absolute path (a directory literally called ``home/x/``
-    would otherwise false-positive).
+    A name is itself text that can leak, so the same canonical detection used
+    for content is applied to it — including the contextual digest rule, which
+    degenerates to same-line context for a single-line name. LV-PRIV-005 is
+    excluded because a tracked path is always repository-relative and can never
+    be a local absolute path (a directory literally called ``home/x/`` would
+    otherwise false-positive).
     """
     normalized = name.replace("\\", "/")
     base = normalized.rsplit("/", 1)[-1]
     hits: list[str] = []
     if _PAYLOAD_NAME.match(base):
         hits.append("LV-PRIV-006")
-    for rid in rules_for_line(normalized):
-        if rid != "LV-PRIV-005" and rid not in hits:
-            hits.append(rid)
+    for finding in scan_text("", normalized):
+        if finding.rule_id != "LV-PRIV-005" and finding.rule_id not in hits:
+            hits.append(finding.rule_id)
     return hits
 
 
-def scan_text(display_path: str, text: str) -> list[Finding]:
+def scan_text(display_path: str, text: str, *, exempt_path: str | None = None) -> list[Finding]:
     findings: list[Finding] = []
     lines = text.splitlines()
     for i, line in enumerate(lines, 1):
-        for rid in rules_for_line(line):
-            findings.append(Finding(display_path, rid, i))
+        rule_ids = list(rules_for_line(line))
         # LV-PRIV-002: a digest plus a digest-context label within a small
         # window, so a label on its own line still binds to the hash below it.
         if _HEX64.search(line):
             lo = max(0, i - 1 - _DIGEST_WINDOW)
             hi = min(len(lines), i + _DIGEST_WINDOW)
             if any(_DIGEST_CONTEXT.search(ctx) for ctx in lines[lo:hi]):
-                findings.append(Finding(display_path, "LV-PRIV-002", i))
+                rule_ids.append("LV-PRIV-002")
+        for rid in rule_ids:
+            if exempt_path is not None and _is_exempt(exempt_path, rid, line):
+                continue
+            findings.append(Finding(display_path, rid, i))
     return findings
 
 
 def text_views(data: bytes) -> list[str]:
-    """Return every plausible text interpretation of ``data``.
+    """Every plausible text interpretation of ``data``.
 
     Encoding is never trusted. UTF-8 (lossy) plus Latin-1 covers ASCII embedded
-    in otherwise-binary content and Latin-1 text; UTF-16 views are added when NUL
-    bytes are present. Views are de-duplicated so pure-ASCII files scan once.
+    in otherwise-binary content and Latin-1 text. UTF-16 views are added when a
+    NUL byte is present; UTF-32 views when the NUL run pattern or a BOM
+    indicates it. Views are de-duplicated so pure-ASCII files scan once.
     """
     views: list[str] = []
 
@@ -245,14 +338,98 @@ def text_views(data: bytes) -> list[str]:
     if b"\x00" in data:
         for codec in ("utf-16-le", "utf-16-be"):
             add(data.decode(codec, errors="replace"))
+    # UTF-32 puts three NULs between ASCII characters; a BOM is also decisive.
+    if b"\x00\x00\x00" in data or data[:4] in (b"\xff\xfe\x00\x00", b"\x00\x00\xfe\xff"):
+        for codec in ("utf-32-le", "utf-32-be"):
+            try:
+                add(data.decode(codec, errors="replace"))
+            except (UnicodeDecodeError, LookupError):
+                continue
     return views
 
 
-def scan_bytes(display_path: str, data: bytes) -> list[Finding]:
+def scan_bytes(display_path: str, data: bytes, *, exempt_path: str | None = None) -> list[Finding]:
     findings: list[Finding] = []
     for view in text_views(data):
-        findings.extend(scan_text(display_path, view))
+        findings.extend(scan_text(display_path, view, exempt_path=exempt_path))
     return findings
+
+
+# --- Archive handling ---------------------------------------------------------
+
+_SIG_ZIP = (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")
+_SIG_GZIP = b"\x1f\x8b"
+_SIG_BZIP2 = b"BZh"
+_SIG_XZ = b"\xfd7zXZ\x00"
+_SIG_7Z = b"7z\xbc\xaf\x27\x1c"
+_SIG_RAR = (b"Rar!\x1a\x07\x00", b"Rar!\x1a\x07\x01")
+
+
+def detect_archive(data: bytes, name: str = "") -> str | None:
+    """Return an archive kind for ``data`` (signature first, then extension).
+
+    Kinds: ``zip``, ``tar``, ``gzip``, ``bzip2``, ``xz``, or ``unsupported``
+    (a recognised format this scanner will not parse). ``None`` means "not an
+    archive", which is the only case that may be treated as ordinary bytes.
+    """
+    if data[:4] in _SIG_ZIP:
+        return "zip"
+    if data[:2] == _SIG_GZIP:
+        return "gzip"
+    if data[:3] == _SIG_BZIP2:
+        return "bzip2"
+    if data[:6] == _SIG_XZ:
+        return "xz"
+    if data[:6] == _SIG_7Z:
+        return "unsupported"
+    if data[:8] in _SIG_RAR:
+        return "unsupported"
+    if len(data) > 262 and data[257:262] == b"ustar":
+        return "tar"
+    lowered = name.lower()
+    if lowered.endswith((".7z", ".rar")):
+        return "unsupported"
+    if lowered.endswith(".zip"):
+        return "zip"
+    if lowered.endswith((".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tar.xz")):
+        return "tar"
+    if lowered.endswith(".gz"):
+        return "gzip"
+    return None
+
+
+def _take_budget(budget: list[int], declared: int, limit: int) -> bool:
+    """True when ``declared`` bytes may be read within both the per-member limit
+    and the shared total budget. Never lets the budget go negative."""
+    return declared <= limit and 0 < budget[0] and declared <= budget[0]
+
+
+def _decompress_bounded(raw: bytes, kind: str, budget: list[int]) -> bytes | None:
+    """Decompress a single-stream container, never producing more than the
+    remaining budget allows. ``None`` signals unscannable."""
+    limit = min(_MAX_MEMBER_BYTES, max(budget[0], 0))
+    if limit <= 0:
+        return None
+    stream = io.BytesIO(raw)
+    try:
+        # Each stdlib wrapper takes its source differently; only gzip uses
+        # `fileobj`. Reading limit+1 bounds decompression regardless of the
+        # declared or actual expanded size.
+        if kind == "gzip":
+            with gzip.GzipFile(fileobj=stream) as fh:
+                out = fh.read(limit + 1)
+        elif kind == "bzip2":
+            with bz2.BZ2File(stream) as fh:
+                out = fh.read(limit + 1)
+        else:
+            with lzma.LZMAFile(stream) as fh:
+                out = fh.read(limit + 1)
+    except Exception:
+        return None
+    if len(out) > limit:
+        return None
+    budget[0] -= len(out)
+    return out
 
 
 def scan_archive(
@@ -261,53 +438,124 @@ def scan_archive(
     *,
     depth: int = 1,
     budget: list[int] | None = None,
+    kind: str | None = None,
 ) -> list[Finding]:
-    """Scan a ZIP archive's members from memory. Recurses into nested archives.
+    """Scan an archive's contents from memory. Recurses into nested archives.
 
-    Never extracts to disk. Any member that cannot be read, or that exceeds a
-    bound, becomes an LV-PRIV-007 finding rather than a silent gap.
+    Never extracts to disk. Any member that cannot be read, or that would exceed
+    a bound, becomes an LV-PRIV-007 finding rather than a silent gap.
     """
     if budget is None:
         budget = [_MAX_TOTAL_BYTES]
-    findings: list[Finding] = []
-
     if depth > _MAX_ARCHIVE_DEPTH:
-        return [Finding(display_path, "LV-PRIV-007", 0)]
+        return [Finding(display_path, "LV-PRIV-007", 0, note="max archive depth")]
 
+    kind = kind or detect_archive(data, display_path)
+    if kind == "unsupported" or kind is None:
+        return [Finding(display_path, "LV-PRIV-007", 0, note="unsupported archive")]
+    if kind == "zip":
+        return _scan_zip(display_path, data, depth, budget)
+    if kind == "tar":
+        return _scan_tar(display_path, data, depth, budget)
+    return _scan_single_stream(display_path, data, kind, depth, budget)
+
+
+def _scan_member(
+    member_display: str, data: bytes, depth: int, budget: list[int]
+) -> list[Finding]:
+    """Scan one extracted member: recurse if it is itself an archive."""
+    kind = detect_archive(data, member_display)
+    if kind is not None:
+        return scan_archive(
+            member_display, data, depth=depth + 1, budget=budget, kind=kind
+        )
+    return scan_bytes(member_display, data)
+
+
+def _scan_zip(display_path: str, data: bytes, depth: int, budget: list[int]) -> list[Finding]:
+    findings: list[Finding] = []
     try:
         zf = zipfile.ZipFile(io.BytesIO(data))
     except Exception:
-        # Malformed / unsupported archive: unscannable, not ignorable.
-        return [Finding(display_path, "LV-PRIV-007", 0)]
-
+        return [Finding(display_path, "LV-PRIV-007", 0, note="malformed zip")]
     with zf:
         for info in zf.infolist():
             member_display = f"{display_path}!{info.filename}"
             if info.is_dir():
                 continue
-            for rid in rules_for_name(info.filename):
-                findings.append(Finding(member_display, rid, 0))
-            if info.file_size > _MAX_MEMBER_BYTES or budget[0] <= 0:
-                findings.append(Finding(member_display, "LV-PRIV-007", 0))
+            findings.extend(
+                Finding(member_display, rid, 0) for rid in rules_for_name(info.filename)
+            )
+            if not _take_budget(budget, info.file_size, _MAX_MEMBER_BYTES):
+                findings.append(Finding(member_display, "LV-PRIV-007", 0, note="over budget"))
                 continue
+            limit = min(_MAX_MEMBER_BYTES, budget[0])
             try:
-                member = zf.read(info)
+                with zf.open(info) as fh:
+                    member = fh.read(limit + 1)
             except Exception:
-                # Encrypted, corrupt, or otherwise unreadable member.
-                findings.append(Finding(member_display, "LV-PRIV-007", 0))
+                findings.append(Finding(member_display, "LV-PRIV-007", 0, note="unreadable"))
+                continue
+            if len(member) > limit:
+                # Declared size understated the real payload.
+                findings.append(Finding(member_display, "LV-PRIV-007", 0, note="size mismatch"))
                 continue
             budget[0] -= len(member)
-            if _looks_like_zip(member):
-                findings.extend(
-                    scan_archive(member_display, member, depth=depth + 1, budget=budget)
-                )
-                continue
-            findings.extend(scan_bytes(member_display, member))
+            findings.extend(_scan_member(member_display, member, depth, budget))
     return findings
 
 
-def _looks_like_zip(data: bytes) -> bool:
-    return data[:4] in (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")
+def _scan_tar(display_path: str, data: bytes, depth: int, budget: list[int]) -> list[Finding]:
+    findings: list[Finding] = []
+    try:
+        tf = tarfile.open(fileobj=io.BytesIO(data), mode="r:*")
+    except Exception:
+        return [Finding(display_path, "LV-PRIV-007", 0, note="malformed tar")]
+    with tf:
+        try:
+            members = tf.getmembers()
+        except Exception:
+            return [Finding(display_path, "LV-PRIV-007", 0, note="malformed tar")]
+        for info in members:
+            member_display = f"{display_path}!{info.name}"
+            if not info.isfile():
+                # Directories carry no content; a link's target name is still text.
+                findings.extend(
+                    Finding(member_display, rid, 0) for rid in rules_for_name(info.name)
+                )
+                continue
+            findings.extend(
+                Finding(member_display, rid, 0) for rid in rules_for_name(info.name)
+            )
+            if not _take_budget(budget, info.size, _MAX_MEMBER_BYTES):
+                findings.append(Finding(member_display, "LV-PRIV-007", 0, note="over budget"))
+                continue
+            limit = min(_MAX_MEMBER_BYTES, budget[0])
+            try:
+                fh = tf.extractfile(info)
+                member = fh.read(limit + 1) if fh is not None else b""
+            except Exception:
+                findings.append(Finding(member_display, "LV-PRIV-007", 0, note="unreadable"))
+                continue
+            if len(member) > limit:
+                findings.append(Finding(member_display, "LV-PRIV-007", 0, note="size mismatch"))
+                continue
+            budget[0] -= len(member)
+            findings.extend(_scan_member(member_display, member, depth, budget))
+    return findings
+
+
+def _scan_single_stream(
+    display_path: str, data: bytes, kind: str, depth: int, budget: list[int]
+) -> list[Finding]:
+    inner = _decompress_bounded(data, kind, budget)
+    if inner is None:
+        return [Finding(display_path, "LV-PRIV-007", 0, note=f"undecompressable {kind}")]
+    member_display = f"{display_path}!<{kind}-stream>"
+    return _scan_member(member_display, inner, depth, budget)
+
+
+# --- Tracked-entry scanning ---------------------------------------------------
 
 
 def scan_tracked_entry(rel_path: str, abs_path: Path) -> list[Finding]:
@@ -319,11 +567,11 @@ def scan_tracked_entry(rel_path: str, abs_path: Path) -> list[Finding]:
         # Never follow the link. Git stores the target string as the content, so
         # scanning that string catches a link pointing at a private location.
         try:
-            target = abs_path.readlink()
+            target = str(abs_path.readlink())
         except OSError:
-            return findings + [Finding(rel_path, "LV-PRIV-007", 0)]
-        findings.extend(scan_text(rel_path, str(target)))
-        findings.extend(Finding(rel_path, rid, 0) for rid in rules_for_name(str(target)))
+            return findings + [Finding(rel_path, "LV-PRIV-007", 0, note="unreadable link")]
+        findings.extend(scan_text(rel_path, target))
+        findings.extend(Finding(rel_path, rid, 0) for rid in rules_for_name(target))
         return findings
 
     if abs_path.is_dir():
@@ -333,16 +581,17 @@ def scan_tracked_entry(rel_path: str, abs_path: Path) -> list[Finding]:
     try:
         data = abs_path.read_bytes()
     except OSError:
-        return findings + [Finding(rel_path, "LV-PRIV-007", 0)]
+        return findings + [Finding(rel_path, "LV-PRIV-007", 0, note="unreadable")]
 
     if len(data) > _MAX_MEMBER_BYTES:
-        return findings + [Finding(rel_path, "LV-PRIV-007", 0)]
+        return findings + [Finding(rel_path, "LV-PRIV-007", 0, note="oversized")]
 
-    if abs_path.suffix.lower() == ".zip" or _looks_like_zip(data):
-        findings.extend(scan_archive(rel_path, data))
+    kind = detect_archive(data, rel_path)
+    if kind is not None:
+        findings.extend(scan_archive(rel_path, data, kind=kind))
         return findings
 
-    findings.extend(scan_bytes(rel_path, data))
+    findings.extend(scan_bytes(rel_path, data, exempt_path=rel_path))
     return findings
 
 
@@ -377,10 +626,7 @@ def scan_repository() -> list[Finding]:
     root = _repo_root()
     findings: list[Finding] = []
     for rel in _tracked_files(root):
-        exempt = ALLOWLIST.get(rel, frozenset())
-        for finding in scan_tracked_entry(rel, root / rel):
-            if finding.rule_id not in exempt:
-                findings.append(finding)
+        findings.extend(scan_tracked_entry(rel, root / rel))
     return findings
 
 
@@ -388,7 +634,8 @@ def main() -> int:
     try:
         findings = scan_repository()
     except ScanError as exc:
-        # Fail closed: an unperformable scan is never a pass.
+        # Fail closed: an unperformable scan is never a pass. The message names
+        # no path, so it cannot leak an unsafe name.
         print(f"PRIVACY SCAN FAILED: {exc}", file=sys.stderr)
         return 2
     unique = sorted(set(findings), key=lambda x: (x.path, x.line, x.rule_id))

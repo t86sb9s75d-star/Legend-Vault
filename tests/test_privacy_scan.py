@@ -1,10 +1,12 @@
 """Tests for scripts/privacy_scan.py.
 
 All prohibited values here are synthetic (reserved example domains, obviously
-fake tokens, invented paths, runtime-built hex). This file is on the scanner's
-allowlist, so its synthetic literals do not trip the repository scan; the tests
-call the scanner functions directly on in-memory strings and temp files created
-outside the tracked tree.
+fake tokens, invented paths, runtime-built hex) and every prohibited *shape* is
+assembled at runtime from fragments, so this tracked file contains no contiguous
+scanner-matching value and needs **no allowlist exemption at all**. The tests
+call the scanner functions directly on in-memory strings, on temp files created
+outside the tracked tree, and — for output-safety cases — through the real CLI
+entry point in a throwaway git repository.
 
 Coverage is organised as: per-rule detection (positive), false-positive guards
 (negative), bounds/edge behaviour (boundary), and adversarial bypass regressions
@@ -14,8 +16,13 @@ revision of the scanner).
 
 from __future__ import annotations
 
+import bz2
+import gzip
 import io
+import lzma
+import subprocess
 import sys
+import tarfile
 import tempfile
 import zipfile
 from pathlib import Path
@@ -25,8 +32,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import privacy_scan  # noqa: E402
 from privacy_scan import (  # noqa: E402
     ALL_RULES,
-    ALLOWLIST,
+    detect_archive,
+    exemption_reasons,
+    exemptions,
     rules_for_name,
+    safe_location,
     scan_archive,
     scan_bytes,
     scan_text,
@@ -34,11 +44,20 @@ from privacy_scan import (  # noqa: E402
     text_views,
 )
 
-# Synthetic constants (never copied from any real export).
+# Synthetic constants. Every prohibited *shape* is assembled at runtime from
+# fragments so this tracked source file contains no contiguous value that the
+# scanner would match — the test file therefore needs no allowlist exemption.
 _FAKE_HEX = "deadbeef" * 8  # 64 hex chars, obviously synthetic
-_FAKE_GH_TOKEN = "ghp_" + "A" * 36
-_FAKE_EMAIL = "person@example.com"  # reserved example domain
-_FAKE_HOME = "/home/alice/vault/records/x"
+_FAKE_GH_TOKEN = "ghp" + "_" + "A" * 36
+_FAKE_EMAIL = "person" + "@" + "example" + ".com"  # reserved example domain
+_FAKE_HOME = "/ho" + "me/alice/vault/records/x"
+_FAKE_WIN_PATH = "c:" + chr(92) + "us" + "ers" + chr(92) + "bob" + chr(92) + "rec.json"
+_FAKE_PRIVATE_TARGET = "/ho" + "me/someone/Legend-Vault-Data/records/r.json"
+_FAKE_KEY_HEADER = "-----BEGIN RSA PRIVATE " + "KEY-----"
+_FAKE_PGP_HEADER = "-----BEGIN PGP PRIVATE " + "KEY BLOCK-----"
+_FAKE_EXPORT_ZIP = "SyntheticVault RawRec" + "ord 2000-01-01.zip"
+_FAKE_EXPORT_TGZ = "SyntheticVault RawRec" + "ord 2000-01-01.tar.gz"
+_FAKE_CGPT_ARCHIVE = "ChatGPT Ex" + "port 2000.zip"
 
 
 def _ids(findings) -> set[str]:
@@ -56,7 +75,7 @@ def _tmp_file(d: Path, name: str, data: bytes) -> Path:
 
 def test_synthetic_private_export_filename_rejected() -> None:
     assert "LV-PRIV-001" in _ids(
-        scan_text("report.md", "Source archive: SyntheticVault RawRecord 2000-01-01.zip")
+        scan_text("report.md", "Source archive: " + _FAKE_EXPORT_ZIP)
     )
 
 
@@ -73,7 +92,7 @@ def test_fake_api_token_rejected() -> None:
 
 
 def test_private_key_header_rejected() -> None:
-    assert "LV-PRIV-003" in _ids(scan_text("key.txt", "-----BEGIN RSA PRIVATE KEY-----"))
+    assert "LV-PRIV-003" in _ids(scan_text("key.txt", _FAKE_KEY_HEADER))
 
 
 def test_local_user_path_rejected() -> None:
@@ -109,7 +128,7 @@ def test_safe_synthetic_fixture_passes() -> None:
 
 def test_repo_relative_home_dir_is_not_a_local_path() -> None:
     # A repo-relative path can never be an absolute local path.
-    assert rules_for_name("docs/home/alice/guide.md") == []
+    assert rules_for_name("docs/ho" + "me/alice/guide.md") == []
 
 
 def test_sanitized_stress_report_passes() -> None:
@@ -139,19 +158,46 @@ def test_output_is_deterministic() -> None:
 # --- allowlist is rule-scoped, narrow, documented -----------------------------
 
 
-def test_allowlist_is_rule_scoped_and_narrow() -> None:
-    assert set(ALLOWLIST) == {
-        "scripts/privacy_scan.py",
-        "tests/test_privacy_scan.py",
-        ".gitignore",
-    }
-    # .gitignore may name export payloads/archives, but is NOT trusted for
-    # secrets, personal identifiers, or local paths.
-    gitignore_exempt = ALLOWLIST[".gitignore"]
-    assert gitignore_exempt == {"LV-PRIV-001", "LV-PRIV-006"}
-    for rule in ("LV-PRIV-002", "LV-PRIV-003", "LV-PRIV-004", "LV-PRIV-005", "LV-PRIV-007"):
-        assert rule not in gitignore_exempt
-    assert ALLOWLIST["scripts/privacy_scan.py"] == ALL_RULES
+def test_no_file_is_exempt_from_every_rule() -> None:
+    # The core property: whole-file trust must not exist in any form.
+    for path, rules in exemptions().items():
+        assert set(rules) != set(ALL_RULES), path
+        assert len(rules) < len(ALL_RULES), path
+
+
+def test_scanner_and_test_sources_have_no_exemptions() -> None:
+    # Both files carry rule-shaped text yet are fully scanned: prohibited shapes
+    # are assembled at runtime instead of being exempted.
+    summary = exemptions()
+    assert "scripts/privacy_scan.py" not in summary
+    assert "tests/test_privacy_scan.py" not in summary
+
+
+def test_unscannable_rule_can_never_be_exempted() -> None:
+    for path, rules in exemptions().items():
+        assert "LV-PRIV-007" not in rules, path
+
+
+def test_every_exemption_is_line_scoped_and_documented() -> None:
+    reasons = exemption_reasons()
+    assert reasons, "expected at least one narrow exemption"
+    for (path, rule_id, digest), reason in reasons.items():
+        assert path == ".gitignore"          # the only file needing any
+        assert rule_id == "LV-PRIV-001"      # exactly one rule
+        assert len(digest) == 64             # bound to one exact line
+        assert reason.strip()                # written reason
+
+
+def test_exemption_is_alteration_sensitive() -> None:
+    # An exempted pattern is exempt only as that exact line; altering it, or
+    # putting the same text in another file, restores detection.
+    exempt_line = next(iter(exemption_reasons()))
+    assert privacy_scan._is_exempt(".gitignore", "LV-PRIV-001", "chatgpt-ex" + "port*.zip")
+    assert not privacy_scan._is_exempt(
+        ".gitignore", "LV-PRIV-001", "chatgpt-ex" + "port*.zip  # edited"
+    )
+    assert not privacy_scan._is_exempt("other.txt", "LV-PRIV-001", "chatgpt-ex" + "port*.zip")
+    assert exempt_line[0] == ".gitignore"
 
 
 # --- adversarial regressions (each was a demonstrated bypass) -----------------
@@ -263,18 +309,18 @@ def test_segmented_and_additional_secret_shapes_detected() -> None:
         "key = sk-proj-" + "B" * 40,
         "token: github_pat_" + "C" * 40,
         "api = AIza" + "D" * 35,
-        "-----BEGIN PGP PRIVATE KEY BLOCK-----",
+        _FAKE_PGP_HEADER,
     ):
         assert "LV-PRIV-003" in _ids(scan_text("c.txt", line)), line
 
 
 def test_lowercase_windows_user_path_detected() -> None:
-    assert "LV-PRIV-005" in _ids(scan_text("r.md", r"saved to c:\users\bob\vault\rec.json"))
+    assert "LV-PRIV-005" in _ids(scan_text("r.md", "saved to " + _FAKE_WIN_PATH))
 
 
 def test_export_archive_with_other_extension_detected() -> None:
     assert "LV-PRIV-001" in _ids(
-        scan_text("r.md", "archive: SyntheticVault RawRecord 2000-01-01.tar.gz")
+        scan_text("r.md", "archive: " + _FAKE_EXPORT_TGZ)
     )
 
 
@@ -289,7 +335,7 @@ def test_dangling_symlink_name_is_still_checked() -> None:
 def test_symlink_target_pointing_at_private_path_is_detected() -> None:
     with tempfile.TemporaryDirectory() as d:
         link = Path(d) / "link"
-        link.symlink_to("/home/someone/Legend-Vault-Data/records/r.json")
+        link.symlink_to(_FAKE_PRIVATE_TARGET)
         assert "LV-PRIV-005" in _ids(scan_tracked_entry("link", link))
 
 
@@ -309,7 +355,7 @@ def test_prohibited_value_in_zip_text_member_detected() -> None:
 
 def test_prohibited_value_in_names_detected() -> None:
     assert "LV-PRIV-004" in rules_for_name(f"docs/{_FAKE_EMAIL}-notes.md")
-    assert "LV-PRIV-001" in rules_for_name("archive/ChatGPT Export 2000.zip")
+    assert "LV-PRIV-001" in rules_for_name("archive/" + _FAKE_CGPT_ARCHIVE)
     with tempfile.TemporaryDirectory() as d:
         z = Path(d) / "mn.zip"
         with zipfile.ZipFile(z, "w") as zf:
@@ -345,6 +391,339 @@ def test_oversized_file_is_reported_unscannable() -> None:
             assert "LV-PRIV-007" in _ids(scan_tracked_entry("big.bin", p))
         finally:
             privacy_scan._MAX_MEMBER_BYTES = original
+
+
+
+# --- CLI output safety: prohibited values must never reach stdout/stderr ------
+
+
+def _run_cli_repo(files: dict, symlinks: dict | None = None):
+    """Build a throwaway git repo, track files, and run the real CLI entry point.
+
+    Returns (returncode, stdout, stderr). Nothing touches the real repository.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        repo = Path(d)
+        subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.email", "t@invalid"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.name", "t"], cwd=repo, check=True)
+        for rel, data in files.items():
+            target = repo / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(data)
+            subprocess.run(["git", "add", "-f", rel], cwd=repo, check=True)
+        for rel, dest in (symlinks or {}).items():
+            (repo / rel).symlink_to(dest)
+            subprocess.run(["git", "add", "-f", rel], cwd=repo, check=True)
+        proc = subprocess.run(
+            [sys.executable, str(_SCANNER)], cwd=repo, capture_output=True, text=True
+        )
+        return proc.returncode, proc.stdout, proc.stderr
+
+
+_SCANNER = Path(__file__).resolve().parents[1] / "scripts" / "privacy_scan.py"
+
+
+def test_cli_output_excludes_email_in_filename() -> None:
+    rc, out, err = _run_cli_repo({f"docs/{_FAKE_EMAIL}-notes.md": b"safe"})
+    assert rc == 1
+    assert _FAKE_EMAIL not in out and _FAKE_EMAIL not in err
+    assert "redacted-name:" in out
+
+
+def test_cli_output_excludes_token_in_filename() -> None:
+    rc, out, err = _run_cli_repo({f"docs/{_FAKE_GH_TOKEN}.md": b"safe"})
+    assert rc == 1
+    assert _FAKE_GH_TOKEN not in out and _FAKE_GH_TOKEN not in err
+
+
+def test_cli_output_excludes_unsafe_archive_member_names() -> None:
+    inner = io.BytesIO()
+    with zipfile.ZipFile(inner, "w") as izf:
+        izf.writestr(f"{_FAKE_EMAIL}-inner.txt", "x")
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr(f"{_FAKE_EMAIL}-member.txt", "x")
+        zf.writestr("nested.zip", inner.getvalue())
+    rc, out, err = _run_cli_repo({"bundle.zip": buf.getvalue()})
+    assert rc == 1
+    assert _FAKE_EMAIL not in out and _FAKE_EMAIL not in err
+    # The safe outer location is still identifiable.
+    assert "bundle.zip" in out
+
+
+def test_cli_output_excludes_symlink_target_value() -> None:
+    rc, out, err = _run_cli_repo({"keep.md": b"safe"}, symlinks={"lnk": _FAKE_PRIVATE_TARGET})
+    assert rc == 1
+    assert _FAKE_PRIVATE_TARGET not in out and _FAKE_PRIVATE_TARGET not in err
+
+
+def test_cli_keeps_safe_paths_readable() -> None:
+    rc, out, err = _run_cli_repo({"docs/notes.md": ("mail " + _FAKE_EMAIL).encode()})
+    assert rc == 1
+    assert "docs/notes.md" in out          # safe components preserved verbatim
+    assert _FAKE_EMAIL not in out and _FAKE_EMAIL not in err
+
+
+def test_safe_location_is_stable_and_component_scoped() -> None:
+    unsafe = f"docs/{_FAKE_EMAIL}/inner.md"
+    first, second = safe_location(unsafe), safe_location(unsafe)
+    assert first == second                      # stable
+    assert _FAKE_EMAIL not in first
+    assert first.startswith("docs/") and first.endswith("/inner.md")  # scoped
+
+
+# --- archive format boundaries ------------------------------------------------
+
+
+def _tar_bytes(name: str, payload: bytes, compress: str | None = None) -> bytes:
+    raw = io.BytesIO()
+    with tarfile.open(fileobj=raw, mode="w" if compress is None else f"w:{compress}") as tf:
+        info = tarfile.TarInfo(name)
+        info.size = len(payload)
+        tf.addfile(info, io.BytesIO(payload))
+    return raw.getvalue()
+
+
+def test_tar_content_is_inspected() -> None:
+    data = _tar_bytes("note.txt", ("contact " + _FAKE_EMAIL).encode())
+    assert "LV-PRIV-004" in _ids(scan_archive("bundle.tar", data))
+
+
+def test_tar_gz_and_tgz_content_is_inspected() -> None:
+    data = _tar_bytes("note.txt", ("contact " + _FAKE_EMAIL).encode(), "gz")
+    for name in ("bundle.tar.gz", "bundle.tgz"):
+        assert "LV-PRIV-004" in _ids(scan_archive(name, data)), name
+
+
+def test_gzip_stream_content_is_inspected() -> None:
+    data = gzip.compress(("path " + _FAKE_HOME).encode())
+    assert "LV-PRIV-005" in _ids(scan_archive("blob.gz", data))
+
+
+def test_bzip2_and_xz_streams_are_inspected() -> None:
+    for data in (
+        bz2.compress(("contact " + _FAKE_EMAIL).encode()),
+        lzma.compress(("contact " + _FAKE_EMAIL).encode()),
+    ):
+        assert "LV-PRIV-004" in _ids(scan_archive("blob.bin", data))
+
+
+def test_unsupported_archive_formats_fail_closed() -> None:
+    for data, name in (
+        (b"7z\xbc\xaf\x27\x1c" + b"\x00" * 32, "bundle.7z"),
+        (b"Rar!\x1a\x07\x00" + b"\x00" * 32, "bundle.rar"),
+    ):
+        assert "LV-PRIV-007" in _ids(scan_archive(name, data))
+    # Extension-only detection, with no usable signature, must also fail closed.
+    assert "LV-PRIV-007" in _ids(scan_archive("mystery.7z", b"not really an archive"))
+
+
+def test_archive_detected_by_signature_despite_extension() -> None:
+    data = _tar_bytes("note.txt", ("contact " + _FAKE_EMAIL).encode())
+    with tempfile.TemporaryDirectory() as d:
+        p = _tmp_file(Path(d), "harmless.md", data)
+        assert "LV-PRIV-004" in _ids(scan_tracked_entry("harmless.md", p))
+
+
+def test_archive_lookalike_name_is_not_a_false_positive() -> None:
+    with tempfile.TemporaryDirectory() as d:
+        p = _tmp_file(Path(d), "notes-about-tar.md", b"plain prose about archives\n")
+        assert scan_tracked_entry("notes-about-tar.md", p) == []
+
+
+def test_nested_mixed_formats_are_bounded() -> None:
+    inner = _tar_bytes("leak.txt", ("contact " + _FAKE_EMAIL).encode())
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("inner.tar", inner)
+    ids = _ids(scan_archive("outer.zip", buf.getvalue()))
+    assert "LV-PRIV-004" in ids or "LV-PRIV-007" in ids
+
+
+def test_archives_are_never_extracted_to_disk() -> None:
+    data = _tar_bytes("note.txt", ("contact " + _FAKE_EMAIL).encode(), "gz")
+    with tempfile.TemporaryDirectory() as d:
+        before = set(Path(d).rglob("*"))
+        p = _tmp_file(Path(d), "b.tgz", data)
+        scan_tracked_entry("b.tgz", p)
+        after = set(Path(d).rglob("*"))
+        assert after == before | {p}
+
+
+def test_detect_archive_classifies_known_kinds() -> None:
+    assert detect_archive(b"PK\x03\x04rest") == "zip"
+    assert detect_archive(gzip.compress(b"x")) == "gzip"
+    assert detect_archive(b"plain text", "notes.md") is None
+
+
+# --- UTF-32 and encoding coverage ---------------------------------------------
+
+
+def test_utf32_variants_are_scanned() -> None:
+    for codec in ("utf-32", "utf-32-le", "utf-32-be"):
+        data = ("contact " + _FAKE_EMAIL).encode(codec)
+        assert "LV-PRIV-004" in _ids(scan_bytes("f.md", data)), codec
+
+
+def test_utf32_inside_zip_member_is_scanned() -> None:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("m.txt", ("contact " + _FAKE_EMAIL).encode("utf-32-le"))
+    assert "LV-PRIV-004" in _ids(scan_archive("u32.zip", buf.getvalue()))
+
+
+def test_safe_utf32_content_passes() -> None:
+    assert scan_bytes("f.md", "ordinary synthetic prose".encode("utf-32-le")) == []
+
+
+def test_text_views_are_deterministic_and_bounded() -> None:
+    data = ("contact " + _FAKE_EMAIL).encode("utf-32-le")
+    assert text_views(data) == text_views(data)
+    assert len(text_views(b"plain ascii")) == 1
+
+
+# --- contextual digest detection in names -------------------------------------
+
+
+def test_source_labeled_digest_in_filename_is_detected() -> None:
+    assert "LV-PRIV-002" in rules_for_name(f"Source SHA-256 {_FAKE_HEX}.txt")
+    assert "LV-PRIV-002" in rules_for_name(f"Archive digest {_FAKE_HEX}.txt")
+
+
+def test_source_labeled_digest_in_member_names_is_detected() -> None:
+    inner = io.BytesIO()
+    with zipfile.ZipFile(inner, "w") as izf:
+        izf.writestr(f"Archive digest {_FAKE_HEX}.txt", "x")
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr(f"Source SHA-256 {_FAKE_HEX}.txt", "x")
+        zf.writestr("nested.zip", inner.getvalue())
+    assert "LV-PRIV-002" in _ids(scan_archive("b.zip", buf.getvalue()))
+
+
+def test_bare_public_hash_filename_is_accepted() -> None:
+    assert rules_for_name(f"artifacts/{_FAKE_HEX}.bin") == []
+
+
+def test_digest_finding_output_does_not_reproduce_the_digest() -> None:
+    rc, out, err = _run_cli_repo({f"Source SHA-256 {_FAKE_HEX}.txt": b"safe"})
+    assert rc == 1
+    assert _FAKE_HEX not in out and _FAKE_HEX not in err
+
+
+# --- total archive budget -----------------------------------------------------
+
+
+def _with_budget(total: int, member: int):
+    """Temporarily shrink the scanner's bounds."""
+    return (
+        (privacy_scan._MAX_TOTAL_BYTES, privacy_scan._MAX_MEMBER_BYTES),
+        setattr(privacy_scan, "_MAX_TOTAL_BYTES", total),
+        setattr(privacy_scan, "_MAX_MEMBER_BYTES", member),
+    )[0]
+
+
+def _restore_budget(saved) -> None:
+    privacy_scan._MAX_TOTAL_BYTES, privacy_scan._MAX_MEMBER_BYTES = saved
+
+
+def _counted_scan(data: bytes):
+    """Scan an archive while counting bytes actually decompressed."""
+    counted = {"n": 0}
+    real_open = zipfile.ZipFile.open
+
+    class _CountingReader(io.RawIOBase):
+        def __init__(self, inner):
+            self._inner = inner
+
+        def read(self, size=-1):
+            chunk = self._inner.read(size)
+            counted["n"] += len(chunk)
+            return chunk
+
+        def close(self):
+            self._inner.close()
+
+    def patched_open(self, name, mode="r", pwd=None, **kw):
+        return _CountingReader(real_open(self, name, mode, pwd, **kw))
+
+    zipfile.ZipFile.open = patched_open
+    try:
+        findings = scan_archive("z.zip", data)
+    finally:
+        zipfile.ZipFile.open = real_open
+    return findings, counted["n"]
+
+
+def test_total_budget_is_enforced_before_decompression() -> None:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("a.txt", "A" * 700)
+        zf.writestr("b.txt", "B" * 700)
+    saved = _with_budget(1000, 800)
+    try:
+        findings, read_bytes = _counted_scan(buf.getvalue())
+    finally:
+        _restore_budget(saved)
+    assert read_bytes <= 1000, read_bytes          # never over-read
+    assert "LV-PRIV-007" in _ids(findings)          # and it fails closed
+
+
+def test_member_exactly_at_limit_is_read_and_one_over_is_rejected() -> None:
+    for size, expect_finding in ((100, False), (101, True)):
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr("m.txt", "A" * size)
+        saved = _with_budget(10_000, 100)
+        try:
+            ids = _ids(scan_archive("z.zip", buf.getvalue()))
+        finally:
+            _restore_budget(saved)
+        assert ("LV-PRIV-007" in ids) is expect_finding, size
+
+
+def test_nested_archives_share_one_total_budget() -> None:
+    inner = io.BytesIO()
+    with zipfile.ZipFile(inner, "w") as izf:
+        izf.writestr("i.txt", "I" * 400)
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("a.txt", "A" * 400)
+        zf.writestr("inner.zip", inner.getvalue())
+    saved = _with_budget(500, 450)
+    try:
+        findings, read_bytes = _counted_scan(buf.getvalue())
+    finally:
+        _restore_budget(saved)
+    assert read_bytes <= 500 + 450, read_bytes
+    assert "LV-PRIV-007" in _ids(findings)
+
+
+def test_high_expansion_ratio_member_is_bounded() -> None:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("bomb.txt", "A" * 200_000)  # compresses to a few hundred bytes
+    saved = _with_budget(5_000, 1_000)
+    try:
+        findings, read_bytes = _counted_scan(buf.getvalue())
+    finally:
+        _restore_budget(saved)
+    assert read_bytes <= 5_000, read_bytes
+    assert "LV-PRIV-007" in _ids(findings)
+
+
+def test_budget_failure_output_is_safe() -> None:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr(f"{_FAKE_EMAIL}.txt", "A" * 700)
+    saved = _with_budget(10, 10)
+    try:
+        rendered = [str(f) for f in scan_archive("z.zip", buf.getvalue())]
+    finally:
+        _restore_budget(saved)
+    assert rendered
+    assert all(_FAKE_EMAIL not in r for r in rendered)
 
 
 _TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]

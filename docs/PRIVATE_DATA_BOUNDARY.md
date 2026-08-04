@@ -189,7 +189,8 @@ finding. Rules:
 - `LV-PRIV-004` personal-identifier (emails, account/user IDs with real values)
 - `LV-PRIV-005` local-private-path (local user home paths)
 - `LV-PRIV-006` raw-export-payload (known raw-export payload filenames)
-- `LV-PRIV-007` unscannable-content (content that could not be fully inspected)
+- `LV-PRIV-007` unscannable-content (unreadable, undecodable, malformed,
+  encrypted, unsupported-format, oversized, or too deeply nested content)
 
 ### What "fail closed" means here
 
@@ -201,39 +202,75 @@ the scan exits non-zero instead of reporting success.
 ### Encoding and binary handling
 
 Encoding is not trusted. Every byte stream is scanned through several text
-views — UTF-8 (lossy), Latin-1, and UTF-16 (LE/BE) when NUL bytes are present —
-so UTF-16 text, Latin-1 text, and ASCII embedded inside otherwise-binary content
-are all covered. There is no "looks binary, skip it" path.
+views — UTF-8 (lossy) and Latin-1 always, UTF-16 LE/BE when a NUL byte is
+present, and UTF-32 LE/BE when a NUL-run or BOM indicates it — so UTF-16/UTF-32
+text, Latin-1 text, and ASCII embedded inside otherwise-binary content are all
+covered. There is no "looks binary, skip it" path. The supported set is exactly
+those encodings; other multibyte encodings are not decoded, though their ASCII
+substrings remain visible through the Latin-1 view.
 
 ### Archive handling
 
-Archives are detected by extension **and** by signature, so a ZIP renamed to
-`.md` is still treated as an archive. Members are read **in memory and never
-extracted into the repository**. Nested archives are scanned recursively up to a
-depth limit; deeper nesting, malformed or encrypted archives, unreadable
-members, and oversized members are reported as `LV-PRIV-007`.
+A recognised archive is always either inspected or rejected — never passed
+through as ordinary bytes:
 
-### Names and symlinks
+| Format | Behaviour |
+|---|---|
+| ZIP | inspected in memory, recursively |
+| TAR (plain, `.gz`, `.bz2`, `.xz`) | inspected in memory, recursively |
+| GZIP / BZIP2 / XZ single streams | decompressed under the byte budget, then inspected |
+| 7z, RAR | **not parsed** — reported `LV-PRIV-007` (fail closed) rather than treated as scanned |
+| malformed / encrypted / oversized | reported `LV-PRIV-007` |
+
+Detection is by **signature first, extension second**, so an archive renamed to
+`.md` is still treated as an archive, and a prose file merely *named* like an
+archive is not. Members are read **in memory and never extracted** to disk or
+into the repository. Nested archives are followed to a bounded depth and share
+one total byte budget, which is checked **before** each member is decompressed;
+reads are bounded so a member whose header understates its real size cannot
+exceed the budget.
+
+### Names, symlinks, and safe output
 
 A name is itself text that can leak, so path and archive-member names are
-scanned with the same rules (minus the local-path rule, which cannot apply to a
-repository-relative path). Name rules run even when content cannot be read, so a
-prohibited filename is caught regardless of the entry's state. Symlinks are
-never followed; the link's **target string** is scanned, which is what git
-stores and which catches a link pointing at a private location.
+scanned with the same canonical rules used for content — including the
+contextual digest rule — minus the local-path rule, which cannot apply to a
+repository-relative path. Name rules run even when content cannot be read.
+Symlinks are never followed; the link's **target string** is scanned, which is
+what git stores.
 
-### Allowlist philosophy
+Because a name can *be* the prohibited value, scanner output never prints a
+location verbatim. Each path component is checked, and an unsafe component is
+replaced by a stable one-way marker:
 
-Exemptions are **rule-scoped, never whole-file blanket trust**:
+```text
+docs/<redacted-name:9f2c1a7b40de>/notes.md:0: LV-PRIV-004
+```
 
-| Path | Exempt from | Why |
-|---|---|---|
-| `scripts/privacy_scan.py` | all rules | it defines every rule pattern |
-| `tests/test_privacy_scan.py` | all rules | it exercises every rule with synthetic values |
-| `.gitignore` | `LV-PRIV-001`, `LV-PRIV-006` only | it lists the export/payload names it protects against — and is still scanned for secrets, personal identifiers, and local paths |
+Safe components are preserved so the entry stays identifiable for remediation,
+the marker is deterministic for a given name, and the prohibited substring never
+reaches stdout, stderr, or CI logs. Error paths follow the same rule: the
+fail-closed `ScanError` message names no path at all.
 
-The allowlist is intentionally tiny and is asserted by a test. Widening it
-requires a clear, written justification.
+### Exemption philosophy
+
+**No file is exempt from every rule.** There is no whole-file allowlist, and no
+inline "suppress this" comment anyone can add. An exemption is a single entry
+keyed by *(path, rule, SHA-256 of the exact stripped line)*, which makes it:
+
+- **narrow** — one rule, on one line, in one file;
+- **alteration-sensitive** — edit that line and the exemption stops applying, so
+  neighbouring text can never inherit trust;
+- **documented** — every entry carries a written reason;
+- **deterministic** — no environment input, no heuristics.
+
+Today the repository has exactly three exemptions, all on `.gitignore`, all for
+`LV-PRIV-001`: those lines must literally name the export archives they exclude.
+`scripts/privacy_scan.py` and `tests/test_privacy_scan.py` contain rule-shaped
+text yet hold **no exemptions at all** — their prohibited shapes are assembled
+at runtime from fragments, so a real secret pasted into either file is still
+detected. Tests assert all of this, including that `LV-PRIV-007` can never be
+exempted.
 
 ### Known limits (do not overstate the guarantee)
 
