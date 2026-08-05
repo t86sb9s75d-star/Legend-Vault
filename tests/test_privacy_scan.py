@@ -993,6 +993,66 @@ def test_scan_of_archive_with_undecodable_member_name_does_not_crash() -> None:
         assert _FAKE_EMAIL not in line
 
 
+
+# --- cross-component digest rendering -----------------------------------------
+# The digest rule is contextual, so a label can sit in one path component while
+# the digest sits in another. Judging components in isolation detected the
+# finding and then printed the digest verbatim.
+
+
+def test_split_component_digest_is_redacted_in_tracked_path() -> None:
+    rendered = safe_location(f"Source SHA-256/{_FAKE_HEX}.txt")
+    assert _FAKE_HEX not in rendered
+    assert "redacted-name:" in rendered
+    assert rendered.startswith("Source SHA-256/")   # label kept for remediation
+
+
+def test_split_component_digest_is_redacted_in_archive_member() -> None:
+    rendered = safe_location(f"bundle.zip!Archive digest/{_FAKE_HEX}.bin")
+    assert _FAKE_HEX not in rendered
+    assert rendered.startswith("bundle.zip!")
+
+
+def test_split_component_digest_is_redacted_in_nested_member() -> None:
+    rendered = safe_location(f"o.zip!inner.zip!Vault fingerprint/{_FAKE_HEX}.txt")
+    assert _FAKE_HEX not in rendered
+
+
+def test_digest_label_on_outer_archive_redacts_inner_member() -> None:
+    # Context supplied by a different chunk of the location entirely.
+    rendered = safe_location(f"Source SHA-256.zip!{_FAKE_HEX}.txt")
+    assert _FAKE_HEX not in rendered
+
+
+def test_cli_output_excludes_split_component_digest() -> None:
+    rc, out, err = _run_cli_repo({f"Source SHA-256/{_FAKE_HEX}.txt": b"safe"})
+    assert rc == 1
+    assert _FAKE_HEX not in out and _FAKE_HEX not in err
+    assert "redacted-name:" in out
+
+
+def test_cli_output_excludes_split_component_digest_in_archive() -> None:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr(f"Archive digest/{_FAKE_HEX}.txt", "x")
+    rc, out, err = _run_cli_repo({"bundle.zip": buf.getvalue()})
+    assert rc == 1
+    assert _FAKE_HEX not in out and _FAKE_HEX not in err
+
+
+def test_split_component_digest_with_surrogate_does_not_crash() -> None:
+    rendered = safe_location(f"Source SHA-256/{_FAKE_HEX}-{_SURROGATE}.txt")
+    rendered.encode("utf-8")
+    assert _FAKE_HEX not in rendered
+
+
+def test_bare_hash_without_any_context_is_not_redacted() -> None:
+    # False-positive guard: with no digest context anywhere in the location the
+    # hash is an ordinary public artefact name and stays readable.
+    assert rules_for_name(f"artifacts/{_FAKE_HEX}.bin") == []
+    assert _FAKE_HEX in safe_location(f"artifacts/{_FAKE_HEX}.bin")
+
+
 _TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
 
 

@@ -257,12 +257,25 @@ def _component_is_unsafe(component: str) -> bool:
 def safe_location(location: str) -> str:
     """Render a path / archive-member location without reproducing a prohibited
     value. Safe components are preserved; an unsafe component is replaced by a
-    stable one-way marker so the entry remains identifiable for remediation."""
+    stable one-way marker so the entry remains identifiable for remediation.
+
+    Context is evaluated across the **whole location**, not per component. The
+    digest rule is contextual, so a label can sit in one component while the
+    digest sits in another (``Source SHA-256/<hex>.txt``, or a label on an outer
+    archive with the digest on an inner member). Judging components in isolation
+    would detect that finding and then print the digest verbatim, so any
+    component carrying a digest is redacted whenever the location as a whole
+    supplies digest context. A bare hash with no such context anywhere stays
+    readable.
+    """
+    location_has_digest_context = bool(_DIGEST_CONTEXT.search(location))
     rendered: list[str] = []
     for chunk in location.split("!"):
         parts = []
         for component in chunk.split("/"):
-            if _component_is_unsafe(component):
+            if _component_is_unsafe(component) or (
+                location_has_digest_context and _HEX64.search(component)
+            ):
                 digest = hashlib.sha256(_encode_total(component)).hexdigest()[:12]
                 parts.append(f"<redacted-name:{digest}>")
             else:
