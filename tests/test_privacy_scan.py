@@ -1053,6 +1053,78 @@ def test_bare_hash_without_any_context_is_not_redacted() -> None:
     assert _FAKE_HEX in safe_location(f"artifacts/{_FAKE_HEX}.bin")
 
 
+
+# --- archive link targets ------------------------------------------------------
+# A tar symlink/hardlink carries its target in the header. That target is data
+# the archive ships and must be scanned like a filesystem symlink's target.
+
+
+def _tar_with_link(target: str, kind: bytes = tarfile.SYMTYPE, name: str = "link") -> bytes:
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tf:
+        info = tarfile.TarInfo(name)
+        info.type = kind
+        info.linkname = target
+        info.size = 0
+        tf.addfile(info)
+    return buf.getvalue()
+
+
+def test_tar_symlink_target_with_private_path_detected() -> None:
+    data = _tar_with_link(_FAKE_PRIVATE_TARGET)
+    assert "LV-PRIV-005" in _ids(scan_archive("a.tar", data, kind="tar"))
+
+
+def test_tar_symlink_target_with_email_detected() -> None:
+    data = _tar_with_link(f"{_FAKE_EMAIL}.txt")
+    assert "LV-PRIV-004" in _ids(scan_archive("a.tar", data, kind="tar"))
+
+
+def test_tar_symlink_target_with_export_archive_detected() -> None:
+    data = _tar_with_link(_FAKE_EXPORT_ZIP)
+    assert "LV-PRIV-001" in _ids(scan_archive("a.tar", data, kind="tar"))
+
+
+def test_tar_hardlink_target_is_scanned() -> None:
+    data = _tar_with_link(_FAKE_PRIVATE_TARGET, kind=tarfile.LNKTYPE)
+    assert "LV-PRIV-005" in _ids(scan_archive("a.tar", data, kind="tar"))
+
+
+def test_tar_link_target_is_not_reproduced_in_output() -> None:
+    data = _tar_with_link(f"{_FAKE_EMAIL}.txt")
+    rendered = [str(f) for f in scan_archive("a.tar", data, kind="tar")]
+    assert rendered
+    assert all(_FAKE_EMAIL not in line for line in rendered)
+
+
+def test_link_target_inside_nested_archive_is_scanned() -> None:
+    inner = _tar_with_link(_FAKE_PRIVATE_TARGET)
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("inner.tar", inner)
+    assert "LV-PRIV-005" in _ids(scan_archive("outer.zip", buf.getvalue(), kind="zip"))
+
+
+def test_zip_symlink_target_still_detected_via_content() -> None:
+    # Control: a zip stores a symlink's target as the member's content, which the
+    # ordinary content path already covers.
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        entry = zipfile.ZipInfo("link")
+        entry.external_attr = (0xA1FF) << 16
+        zf.writestr(entry, _FAKE_PRIVATE_TARGET)
+    assert "LV-PRIV-005" in _ids(scan_archive("a.zip", buf.getvalue(), kind="zip"))
+
+
+def test_link_without_target_does_not_false_positive() -> None:
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tf:
+        info = tarfile.TarInfo("plain-dir")
+        info.type = tarfile.DIRTYPE
+        tf.addfile(info)
+    assert scan_archive("a.tar", buf.getvalue(), kind="tar") == []
+
+
 _TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
 
 

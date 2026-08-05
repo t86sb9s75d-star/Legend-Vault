@@ -615,15 +615,23 @@ def _scan_tar(display_path: str, data: bytes, depth: int, budget: Budget) -> lis
             return [Finding(display_path, "LV-PRIV-007", 0, note="malformed tar")]
         for info in members:
             member_display = f"{display_path}!{info.name}"
-            if not info.isfile():
-                # Directories carry no content; a link's target name is still text.
-                findings.extend(
-                    Finding(member_display, rid, 0) for rid in rules_for_name(info.name)
-                )
-                continue
             findings.extend(
                 Finding(member_display, rid, 0) for rid in rules_for_name(info.name)
             )
+            # A symlink/hardlink carries its target as header text. That target is
+            # data the archive ships, so it is scanned exactly like a filesystem
+            # symlink's target (see scan_tracked_entry). Findings are attached to
+            # the member's location, never to the target, so rendering cannot
+            # print the target itself.
+            link_target = getattr(info, "linkname", "") or ""
+            if link_target:
+                findings.extend(scan_text(member_display, link_target))
+                findings.extend(
+                    Finding(member_display, rid, 0) for rid in rules_for_name(link_target)
+                )
+            if not info.isfile():
+                # Directories and links carry no readable member content.
+                continue
             if budget.exhausted:
                 findings.append(Finding(display_path, "LV-PRIV-007", 0, note="budget exhausted"))
                 break
