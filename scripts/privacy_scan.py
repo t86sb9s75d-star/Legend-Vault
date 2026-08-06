@@ -639,8 +639,15 @@ def scan_archive(
         return [Finding(display_path, "LV-PRIV-007", 0, note="max archive depth")]
 
     kind = kind or detect_archive(data, display_path)
-    if kind == "unsupported" or kind is None:
+    if kind == "unsupported":
         return [Finding(display_path, "LV-PRIV-007", 0, note="unsupported archive")]
+    if kind is None:
+        # detect_archive() defines None as "not an archive" — the one case that
+        # may be treated as ordinary bytes. Reporting it unscannable would be
+        # false: the bytes are readable and scanning them yields strictly more
+        # than a finding that says nothing could be inspected. This matches what
+        # scan_tracked_entry() already does with unrecognised data.
+        return scan_bytes(display_path, data)
     if kind == "zip":
         return _scan_zip(display_path, data, depth, budget)
     if kind == "tar":
@@ -830,7 +837,15 @@ def _tracked_files(root: Path) -> list[str]:
         )
     except (OSError, subprocess.CalledProcessError) as exc:
         raise ScanError("cannot enumerate tracked files (git ls-files failed)") from exc
-    return [p for p in out.stdout.decode("utf-8", errors="replace").split("\0") if p]
+    # surrogateescape, never replace: a filename is bytes on POSIX and need not
+    # be valid UTF-8. `replace` substitutes U+FFFD, so the name no longer names
+    # the file — `root / rel` misses, and the entry is reported LV-PRIV-007
+    # "unreadable" while its CONTENT is never scanned and the stated reason is
+    # wrong. surrogateescape round-trips exactly, so the file is opened and
+    # scanned; output stays safe because safe_location()/_printable() already
+    # encode surrogates via _encode_total().
+    decoded = out.stdout.decode("utf-8", errors="surrogateescape")
+    return [p for p in decoded.split("\0") if p]
 
 
 def scan_repository() -> list[Finding]:

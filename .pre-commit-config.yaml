@@ -5,7 +5,12 @@ repos:
     hooks:
       - id: privacy-scan
         name: privacy scan (tracked files, fail closed)
-        entry: python scripts/privacy_scan.py
+        # python3, not python: with language: system the hook runs in the
+        # developer's shell, and on a stock Debian/Ubuntu host there is no
+        # `python` on PATH. The hook would then fail to start — a fail-closed
+        # guard that never runs is the worst kind, so name the interpreter the
+        # shebang already names.
+        entry: python3 scripts/privacy_scan.py
         language: system
         pass_filenames: false
         always_run: true

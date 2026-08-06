@@ -20,6 +20,7 @@ import bz2
 import gzip
 import io
 import lzma
+import os
 import subprocess
 import sys
 import tarfile
@@ -616,12 +617,16 @@ def test_digest_finding_output_does_not_reproduce_the_digest() -> None:
 
 
 def _with_budget(total: int, member: int):
-    """Temporarily shrink the scanner's bounds."""
-    return (
-        (privacy_scan._MAX_TOTAL_BYTES, privacy_scan._MAX_MEMBER_BYTES),
-        setattr(privacy_scan, "_MAX_TOTAL_BYTES", total),
-        setattr(privacy_scan, "_MAX_MEMBER_BYTES", member),
-    )[0]
+    """Temporarily shrink the scanner's bounds; returns the previous values.
+
+    Written as plain statements rather than a tuple of side effects: the order
+    of assignment and of the saved read has to be unambiguous, and a reader
+    should not have to work out that only element [0] was ever the return value.
+    """
+    saved = (privacy_scan._MAX_TOTAL_BYTES, privacy_scan._MAX_MEMBER_BYTES)
+    privacy_scan._MAX_TOTAL_BYTES = total
+    privacy_scan._MAX_MEMBER_BYTES = member
+    return saved
 
 
 def _restore_budget(saved) -> None:
@@ -1497,6 +1502,85 @@ def test_signature_detection_precedes_extension() -> None:
     for signature in (_RAR4_SIG, _RAR5_SIG, b"7z\xbc\xaf\x27\x1c"):
         for name in ("notes.md", "data.txt", "image.png", ""):
             assert detect_archive(signature + b"\x00" * 64, name) == "unsupported"
+
+
+# --- Regressions: a filename is bytes, and a guard must be able to run --------
+
+
+def test_non_utf8_tracked_filename_has_its_content_scanned() -> None:
+    """`git ls-files -z` was decoded with errors="replace".
+
+    A POSIX filename need not be valid UTF-8. U+FFFD substitution meant the name
+    no longer named the file, so the entry was reported LV-PRIV-007 "unreadable"
+    and its content was never scanned — failing closed, but for the wrong reason
+    and without ever looking inside.
+    """
+    raw_name = b"notes-\xff-private.md"
+    with tempfile.TemporaryDirectory() as d:
+        repo = Path(d)
+        subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.email", "t@invalid"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.name", "t"], cwd=repo, check=True)
+        target = os.path.join(os.fsdecode(repo), os.fsdecode(raw_name))
+        with open(os.fsencode(target), "wb") as fh:
+            fh.write(("contact " + _FAKE_EMAIL).encode())
+        subprocess.run(["git", "add", "-f", os.fsdecode(raw_name)], cwd=repo, check=True)
+        proc = subprocess.run(
+            [sys.executable, str(_SCANNER)], cwd=repo, capture_output=True, text=True
+        )
+    combined = proc.stdout + proc.stderr
+    assert proc.returncode == 1
+    assert "LV-PRIV-004" in combined, "content of a non-UTF-8-named file was not scanned"
+    assert _FAKE_EMAIL not in combined, "output reproduced the prohibited value"
+
+
+def test_tracked_path_decoding_round_trips() -> None:
+    raw = b"notes-\xff-private.md"
+    assert os.fsencode(raw.decode("utf-8", errors="surrogateescape")) == raw
+    # The old behaviour, kept explicit so the difference cannot be re-introduced
+    # unnoticed.
+    assert os.fsencode(raw.decode("utf-8", errors="replace")) != raw
+
+
+def test_pre_commit_hook_names_an_interpreter_that_exists() -> None:
+    """`language: system` runs the hook in the developer's shell, where a bare
+    `python` may not exist (stock Debian/Ubuntu). A fail-closed guard that
+    cannot start is worse than no guard, because the failure looks like a pass.
+    """
+    config = (Path(__file__).resolve().parents[1] / ".pre-commit-config.yaml").read_text()
+    entries = [l.strip() for l in config.splitlines() if l.strip().startswith("entry:")]
+    assert entries, "no hook entry found"
+    for entry in entries:
+        command = entry.split(":", 1)[1].split()[0]
+        assert command != "python", f"{entry!r} depends on a bare `python`"
+
+
+def test_run_tests_script_names_an_interpreter_that_exists() -> None:
+    script = (Path(__file__).resolve().parents[1] / "run-tests.sh").read_text()
+    for line in script.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("python "):
+            raise AssertionError(f"{stripped!r} depends on a bare `python`")
+
+
+# --- Regression: scan_archive honours detect_archive's documented contract ----
+
+
+def test_scan_archive_on_non_archive_bytes_scans_them() -> None:
+    # detect_archive() defines None as "not an archive" — the one case that may
+    # be treated as ordinary bytes. Reporting LV-PRIV-007 said nothing could be
+    # inspected, which was false and hid the finding.
+    plain = ("contact " + _FAKE_EMAIL).encode()
+    assert detect_archive(plain, "notes.txt") is None
+    assert "LV-PRIV-004" in _ids(scan_archive("notes.txt", plain))
+
+
+def test_scan_archive_still_fails_closed_on_unsupported_formats() -> None:
+    # The other branch must not have moved: a recognised-but-unparseable format
+    # is still unscannable.
+    for data, name in ((b"7z\xbc\xaf\x27\x1c" + b"\x00" * 32, "x.7z"),
+                       (_RAR4_SIG + b"\x00" * 32, "x.bin")):
+        assert "LV-PRIV-007" in _ids(scan_archive(name, data))
 
 
 _TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
