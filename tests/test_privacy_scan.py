@@ -1125,6 +1125,231 @@ def test_link_without_target_does_not_false_positive() -> None:
     assert scan_archive("a.tar", buf.getvalue(), kind="tar") == []
 
 
+# --- Regressions: absolute private paths as archive member names --------------
+# rules_for_name() dropped LV-PRIV-005 unconditionally. That is correct for a
+# tracked path — git guarantees it is repository-relative — but an archive member
+# name is text chosen by whoever built the archive and may be absolute, so seven
+# member-name shapes went entirely undetected, including bare directory entries
+# that have no content to fall back on.
+
+_FAKE_ABS_HOME = "/ho" + "me/alice/vault/secret.txt"
+_FAKE_ABS_HOME_DIR = "/ho" + "me/alice/vault/"
+_FAKE_ABS_MAC = "/Us" + "ers/alice/vault/secret.txt"
+_FAKE_ABS_WIN = "C:" + chr(92) + "Us" + "ers" + chr(92) + "alice" + chr(92) + "x.txt"
+# A *relative* tracked path that merely contains a `home/` directory. Assembled
+# from fragments like every other prohibited shape here, because the unanchored
+# content rule does match it — that is exactly why the anchored name rule exists.
+_FAKE_REPO_HOME_PATH = "docs/ho" + "me/alice/notes.md"
+
+
+def _zip_with_entries(entries) -> bytes:
+    """entries: (name, data) pairs; data None makes a directory entry."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        for name, data in entries:
+            if data is None:
+                info = zipfile.ZipInfo(name if name.endswith("/") else name + "/")
+                info.external_attr = 0o40755 << 16
+                zf.writestr(info, b"")
+            else:
+                zf.writestr(name, data)
+    return buf.getvalue()
+
+
+def _tar_with_entries(entries) -> bytes:
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tf:
+        for name, data in entries:
+            info = tarfile.TarInfo(name)
+            if data is None:
+                info.type = tarfile.DIRTYPE
+                info.size = 0
+                tf.addfile(info)
+            else:
+                info.size = len(data)
+                tf.addfile(info, io.BytesIO(data))
+    return buf.getvalue()
+
+
+def test_zip_member_named_absolute_private_path_detected() -> None:
+    data = _zip_with_entries([(_FAKE_ABS_HOME, b"innocuous")])
+    assert "LV-PRIV-005" in _ids(scan_archive("a.zip", data, kind="zip"))
+
+
+def test_zip_directory_entry_named_private_path_detected() -> None:
+    # A directory entry carries no content at all: if its name is skipped, the
+    # entry is a blind spot by construction.
+    data = _zip_with_entries([(_FAKE_ABS_HOME_DIR, None)])
+    assert "LV-PRIV-005" in _ids(scan_archive("a.zip", data, kind="zip"))
+
+
+def test_tar_member_named_absolute_private_path_detected() -> None:
+    data = _tar_with_entries([(_FAKE_ABS_HOME, b"innocuous")])
+    assert "LV-PRIV-005" in _ids(scan_archive("a.tar", data, kind="tar"))
+
+
+def test_tar_directory_member_named_private_path_detected() -> None:
+    data = _tar_with_entries([(_FAKE_ABS_HOME_DIR, None)])
+    assert "LV-PRIV-005" in _ids(scan_archive("a.tar", data, kind="tar"))
+
+
+def test_tar_member_named_windows_private_path_detected() -> None:
+    data = _tar_with_entries([(_FAKE_ABS_WIN, b"innocuous")])
+    assert "LV-PRIV-005" in _ids(scan_archive("a.tar", data, kind="tar"))
+
+
+def test_zip_member_named_macos_private_path_detected() -> None:
+    data = _zip_with_entries([(_FAKE_ABS_MAC, b"innocuous")])
+    assert "LV-PRIV-005" in _ids(scan_archive("a.zip", data, kind="zip"))
+
+
+def test_nested_archive_member_named_private_path_detected() -> None:
+    inner = _zip_with_entries([(_FAKE_ABS_HOME, b"innocuous")])
+    outer = _zip_with_entries([("inner.zip", inner)])
+    assert "LV-PRIV-005" in _ids(scan_archive("o.zip", outer, kind="zip"))
+
+
+def test_cli_output_does_not_reproduce_private_member_name() -> None:
+    rc, out, err = _run_cli_repo({"bundle.zip": _zip_with_entries([(_FAKE_ABS_HOME, b"x")])})
+    assert rc == 1
+    # The username is the identifying component and must not survive rendering.
+    assert "alice" not in out and "alice" not in err
+    assert _FAKE_ABS_HOME not in out and _FAKE_ABS_HOME not in err
+
+
+def test_tracked_repo_path_containing_home_directory_is_not_flagged() -> None:
+    # The false-positive guard that makes the repo_relative distinction load
+    # bearing: a tracked path is relative, so a `home/<user>/` directory in it
+    # is part of this repository, not somebody's home directory.
+    assert "LV-PRIV-005" not in rules_for_name(_FAKE_REPO_HOME_PATH)
+
+
+def test_relative_archive_member_with_home_directory_is_not_flagged() -> None:
+    # A relative tree containing `home/` is ordinary inside an archive; only an
+    # absolute member name denotes a real local home directory.
+    data = _tar_with_entries([("home/alice/x.txt", b"ok")])
+    assert "LV-PRIV-005" not in _ids(scan_archive("a.tar", data, kind="tar"))
+
+
+def test_rules_for_name_repo_relative_distinction() -> None:
+    # One name, two judgements — the parameter must actually change behaviour.
+    assert "LV-PRIV-005" not in rules_for_name(_FAKE_ABS_HOME, repo_relative=True)
+    assert "LV-PRIV-005" in rules_for_name(_FAKE_ABS_HOME, repo_relative=False)
+    # …and it must not turn the relative case into a false positive.
+    assert "LV-PRIV-005" not in rules_for_name(_FAKE_REPO_HOME_PATH, repo_relative=False)
+
+
+# --- Regressions: single-stream extension fallback ----------------------------
+# detect_archive() fell back on extension for .gz only. A damaged .bz2/.xz lost
+# its magic bytes, was treated as ordinary bytes, and read as "no findings" —
+# because the payload was still compressed and so invisible to every text view.
+
+
+def _damaged(blob: bytes) -> bytes:
+    broken = bytearray(blob)
+    broken[0] ^= 0xFF  # break the magic, leave the stream otherwise intact
+    return bytes(broken)
+
+
+# Compressible payload, so the compressed form genuinely hides the plaintext.
+_SECRET_PAYLOAD = (("contact " + _FAKE_EMAIL + " at " + _FAKE_HOME + "\n") * 200).encode()
+
+
+def test_compressed_payload_is_invisible_to_text_views() -> None:
+    # The mechanism that makes the missing fallback a silent miss rather than a
+    # harmless mislabel: if the bytes were readable as text, the content rules
+    # would still catch them.
+    assert scan_bytes("x.bin", bz2.compress(_SECRET_PAYLOAD)) == []
+    assert scan_bytes("x.bin", lzma.compress(_SECRET_PAYLOAD)) == []
+
+
+def test_damaged_bz2_stream_is_reported_unscannable() -> None:
+    data = _damaged(bz2.compress(_SECRET_PAYLOAD))
+    assert detect_archive(data, "x.bz2") == "bzip2"
+    assert "LV-PRIV-007" in _ids(scan_archive("x.bz2", data))
+
+
+def test_damaged_xz_stream_is_reported_unscannable() -> None:
+    data = _damaged(lzma.compress(_SECRET_PAYLOAD))
+    assert detect_archive(data, "x.xz") == "xz"
+    assert "LV-PRIV-007" in _ids(scan_archive("x.xz", data))
+
+
+def test_damaged_lzma_stream_is_reported_unscannable() -> None:
+    data = _damaged(lzma.compress(_SECRET_PAYLOAD, format=lzma.FORMAT_ALONE))
+    assert detect_archive(data, "x.lzma") == "xz"
+    assert "LV-PRIV-007" in _ids(scan_archive("x.lzma", data))
+
+
+def test_cli_fails_closed_on_damaged_single_stream_files() -> None:
+    for name, blob in (
+        ("payload.bz2", bz2.compress(_SECRET_PAYLOAD)),
+        ("payload.xz", lzma.compress(_SECRET_PAYLOAD)),
+    ):
+        rc, out, err = _run_cli_repo({name: _damaged(blob)})
+        assert rc == 1, f"{name} passed the scan"
+        assert "LV-PRIV-007" in out
+
+
+def test_intact_bz2_content_is_still_inspected() -> None:
+    data = bz2.compress(("contact " + _FAKE_EMAIL).encode())
+    assert "LV-PRIV-004" in _ids(scan_archive("x.bz2", data))
+
+
+def test_plaintext_named_bz2_is_still_scanned_as_text() -> None:
+    # The fallback must not stop ordinary text that merely carries the extension
+    # from being scanned; it is reported unscannable, which is still a finding.
+    rc, out, err = _run_cli_repo({"notes.bz2": ("contact " + _FAKE_EMAIL).encode()})
+    assert rc == 1
+
+
+# --- Structural guard: detection and rendering may never disagree -------------
+
+
+def test_rendered_output_never_trips_a_content_rule() -> None:
+    """The property whose absence caused four separate leaks.
+
+    Each round so far has had the same shape: a value is correctly *detected*
+    and then reproduced by the code that *reports* it. Rather than test one more
+    instance, assert the invariant over a cross-product of location shapes —
+    every rendered chunk must itself be judged clean, under the strictest
+    (non-repo-relative) reading of the same name rules that flagged the original.
+
+    LV-PRIV-006 is the one documented exception: it names a payload *category*
+    (`conversations.json` is identical in every export and carries nothing
+    user-specific), which is deliberately kept legible for remediation.
+    """
+    pieces = [
+        _FAKE_ABS_HOME,
+        _FAKE_ABS_HOME_DIR,
+        _FAKE_ABS_MAC,
+        _FAKE_ABS_WIN,
+        "//ho" + "me/alice/x/",
+        _FAKE_REPO_HOME_PATH,
+        "home/alice/x.txt",
+        f"Source SHA-256/{_FAKE_HEX}.txt",
+        f"docs/{_FAKE_EMAIL}-notes.md",
+        _FAKE_EXPORT_ZIP,
+        "conversations.json",
+        "Archive digest",
+        f"{_FAKE_HEX}.bin",
+        "plain/dir/file.txt",
+    ]
+    checked = 0
+    for first in pieces:
+        for second in pieces:
+            for location in (first, f"{first}!{second}"):
+                checked += 1
+                for chunk in safe_location(location).split("!"):
+                    residue = [
+                        rule
+                        for rule in rules_for_name(chunk, repo_relative=False)
+                        if rule != "LV-PRIV-006"
+                    ]
+                    assert not residue, f"{location!r} rendered to unsafe {chunk!r}: {residue}"
+    assert checked > 300
+
+
 _TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
 
 

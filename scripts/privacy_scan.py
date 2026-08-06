@@ -36,6 +36,10 @@ Deliberate limits (documented, not hidden)
   indistinguishable from a public hash and is not flagged.
 - Obfuscated forms (e.g. an address written as ``name [at] example.com``) are
   not matched; the false-positive cost is too high.
+- ``LV-PRIV-005`` on a *name* is anchored: an archive member called
+  ``/home/<user>/x`` is flagged, a relative one called ``home/<user>/x`` is not.
+  A relative tree containing ``home/`` is ordinary inside an archive, and a
+  tracked path is repository-relative by construction.
 - Supported text encodings are exactly: UTF-8, Latin-1, UTF-16 LE/BE, UTF-32
   LE/BE. Other multibyte encodings are not decoded (their ASCII substrings are
   still visible through the Latin-1 view).
@@ -143,6 +147,21 @@ _PERSONAL = re.compile(
 # drive-letter user path has no such collision.
 _LOCAL_PATH_POSIX = re.compile(r"(?:/home/|/Users/)[A-Za-z0-9._-]+/")
 _LOCAL_PATH_WIN = re.compile(r"[A-Za-z]:\\Users\\", re.IGNORECASE)
+
+# The same rule anchored to the start of a *name*. A tracked path is always
+# repository-relative, but an archive member name is unconstrained text that may
+# be absolute. Anchoring is what makes the rule safe to apply there: it fires on
+# `/home/<user>/vault/x` while leaving an ordinary relative member such as
+# `home/<user>/x` or `docs/home/<user>/notes.md` alone, since a directory tree
+# containing `home/` is unremarkable inside an archive.
+_ABS_LOCAL_POSIX = re.compile(r"^(?:/home/|/Users/)[A-Za-z0-9._-]+/")
+_ABS_LOCAL_WIN = re.compile(r"^[A-Za-z]:/Users/[A-Za-z0-9._-]+/", re.IGNORECASE)
+
+
+def _is_absolute_local_path(normalized: str) -> bool:
+    """True when a `/`-normalized name denotes an absolute local home path."""
+    collapsed = re.sub(r"/{2,}", "/", normalized)
+    return bool(_ABS_LOCAL_POSIX.match(collapsed) or _ABS_LOCAL_WIN.match(collapsed))
 
 # Known raw-export payload filenames (matched against a basename).
 _PAYLOAD_NAME = re.compile(
@@ -254,6 +273,28 @@ def _component_is_unsafe(component: str) -> bool:
     )
 
 
+_LOCAL_USER_INDEX = 2  # ["", "home", "<user>", …] and ["C:", "Users", "<user>", …]
+
+
+def _identity_component_index(chunk: str) -> int | None:
+    """Index of the user-identifying component of an absolute local home path.
+
+    ``/home/<user>/vault/x`` and ``C:/Users/<user>/x`` both put the username at
+    index 2 once split on ``/``. Only that component is redacted: ``home``,
+    ``Users`` and the drive letter carry no identity, so the entry stays
+    locatable for remediation while the correlatable part is gone. Redacting the
+    username is sufficient rather than minimal — the rendered form no longer
+    matches the rule that flagged it, which is asserted directly by
+    ``test_rendered_output_never_trips_a_content_rule``.
+
+    The backslash form never splits on ``/``, so it stays a single component and
+    is redacted wholesale by ``_component_is_unsafe``.
+    """
+    if not _is_absolute_local_path(chunk.replace("\\", "/")):
+        return None
+    return _LOCAL_USER_INDEX
+
+
 def safe_location(location: str) -> str:
     """Render a path / archive-member location without reproducing a prohibited
     value. Safe components are preserved; an unsafe component is replaced by a
@@ -267,14 +308,22 @@ def safe_location(location: str) -> str:
     component carrying a digest is redacted whenever the location as a whole
     supplies digest context. A bare hash with no such context anywhere stays
     readable.
+
+    An absolute local home path is the other shape whose meaning lives in the
+    component *sequence* rather than in any one component: ``alice`` is only
+    identifying because ``home`` precedes it. ``_identity_component_index``
+    supplies that position.
     """
     location_has_digest_context = bool(_DIGEST_CONTEXT.search(location))
     rendered: list[str] = []
     for chunk in location.split("!"):
+        identity = _identity_component_index(chunk)
         parts = []
-        for component in chunk.split("/"):
-            if _component_is_unsafe(component) or (
-                location_has_digest_context and _HEX64.search(component)
+        for index, component in enumerate(chunk.split("/")):
+            if (
+                index == identity
+                or _component_is_unsafe(component)
+                or (location_has_digest_context and _HEX64.search(component))
             ):
                 digest = hashlib.sha256(_encode_total(component)).hexdigest()[:12]
                 parts.append(f"<redacted-name:{digest}>")
@@ -313,21 +362,30 @@ def rules_for_line(line: str) -> list[str]:
     return hits
 
 
-def rules_for_name(name: str) -> list[str]:
+def rules_for_name(name: str, *, repo_relative: bool = True) -> list[str]:
     """Rules evaluated against a path / archive-member name.
 
     A name is itself text that can leak, so the same canonical detection used
     for content is applied to it — including the contextual digest rule, which
-    degenerates to same-line context for a single-line name. LV-PRIV-005 is
-    excluded because a tracked path is always repository-relative and can never
-    be a local absolute path (a directory literally called ``home/x/`` would
-    otherwise false-positive).
+    degenerates to same-line context for a single-line name.
+
+    ``repo_relative`` states whether the caller can *guarantee* the name is
+    relative to the repository root, which only ``git ls-files`` output can. For
+    such a path LV-PRIV-005 is meaningless — it can never be a local absolute
+    path — while the unanchored rule would false-positive on a directory
+    legitimately called ``docs/home/<user>/``. An archive member name carries no
+    such guarantee: it is text chosen by whoever built the archive and may be
+    absolute, so the anchored ``_is_absolute_local_path`` check applies instead.
+    Passing the wrong value is a detection gap in one direction and a false
+    positive in the other, so callers state it explicitly.
     """
     normalized = name.replace("\\", "/")
     base = normalized.rsplit("/", 1)[-1]
     hits: list[str] = []
     if _PAYLOAD_NAME.match(base):
         hits.append("LV-PRIV-006")
+    if not repo_relative and _is_absolute_local_path(normalized):
+        hits.append("LV-PRIV-005")
     for finding in scan_text("", normalized):
         if finding.rule_id != "LV-PRIV-005" and finding.rule_id not in hits:
             hits.append(finding.rule_id)
@@ -427,8 +485,17 @@ def detect_archive(data: bytes, name: str = "") -> str | None:
         return "zip"
     if lowered.endswith((".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tar.xz")):
         return "tar"
+    # Single-stream compression. Every recognised extension needs a fallback,
+    # not just .gz: a damaged or truncated stream loses its magic bytes, and
+    # without the fallback it would be treated as ordinary bytes — which reads
+    # as "no findings", because the payload is still compressed and therefore
+    # invisible to every text view. Fail closed instead.
     if lowered.endswith(".gz"):
         return "gzip"
+    if lowered.endswith(".bz2"):
+        return "bzip2"
+    if lowered.endswith((".xz", ".lzma")):
+        return "xz"
     return None
 
 
@@ -573,11 +640,15 @@ def _scan_zip(display_path: str, data: bytes, depth: int, budget: Budget) -> lis
     with zf:
         for info in zf.infolist():
             member_display = f"{display_path}!{info.filename}"
+            # Name rules run before the directory check: a directory entry has no
+            # content to fall back on, so its name is the only thing that can be
+            # inspected, and skipping it would make the name a blind spot.
+            findings.extend(
+                Finding(member_display, rid, 0)
+                for rid in rules_for_name(info.filename, repo_relative=False)
+            )
             if info.is_dir():
                 continue
-            findings.extend(
-                Finding(member_display, rid, 0) for rid in rules_for_name(info.filename)
-            )
             if budget.exhausted:
                 # Stop expanding once the shared total is spent; the archive is
                 # reported unscannable rather than partially trusted.
@@ -616,7 +687,8 @@ def _scan_tar(display_path: str, data: bytes, depth: int, budget: Budget) -> lis
         for info in members:
             member_display = f"{display_path}!{info.name}"
             findings.extend(
-                Finding(member_display, rid, 0) for rid in rules_for_name(info.name)
+                Finding(member_display, rid, 0)
+                for rid in rules_for_name(info.name, repo_relative=False)
             )
             # A symlink/hardlink carries its target as header text. That target is
             # data the archive ships, so it is scanned exactly like a filesystem
@@ -627,7 +699,8 @@ def _scan_tar(display_path: str, data: bytes, depth: int, budget: Budget) -> lis
             if link_target:
                 findings.extend(scan_text(member_display, link_target))
                 findings.extend(
-                    Finding(member_display, rid, 0) for rid in rules_for_name(link_target)
+                    Finding(member_display, rid, 0)
+                    for rid in rules_for_name(link_target, repo_relative=False)
                 )
             if not info.isfile():
                 # Directories and links carry no readable member content.

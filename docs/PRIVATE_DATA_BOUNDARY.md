@@ -227,6 +227,14 @@ Detection is by **signature first, extension second**, so an archive renamed to
 archive is not. Members are read **in memory and never extracted** to disk or
 into the repository. Nested archives are followed to a bounded depth.
 
+The extension half of that rule covers **every** recognised compression
+extension — `.gz`, `.bz2`, `.xz`, `.lzma` — not just the common one. A damaged
+or truncated stream loses its magic bytes, and a format missing from the
+fallback would then be treated as ordinary bytes and read as "no findings",
+because the payload is still compressed and therefore invisible to every text
+view. That is a silent miss rather than a harmless mislabel, so the fallback
+fails closed to `LV-PRIV-007` instead.
+
 #### Resource accounting is debit-on-consumption
 
 The byte budget measures **expanded bytes inspected** — decompressed or
@@ -253,11 +261,23 @@ of this budget.
 ### Names, symlinks, and safe output
 
 A name is itself text that can leak, so path and archive-member names are
-scanned with the same canonical rules used for content — including the
-contextual digest rule — minus the local-path rule, which cannot apply to a
-repository-relative path. Name rules run even when content cannot be read.
-Symlinks are never followed; the link's **target string** is scanned, which is
-what git stores.
+scanned with the same canonical rules used for content, including the contextual
+digest rule. Name rules run even when content cannot be read — which is the only
+thing that can be inspected for a directory entry, since it has no content at
+all. Symlinks are never followed; the link's **target string** is scanned, which
+is what git stores, and the same applies to a link target recorded inside a tar
+header.
+
+The local-path rule is the one rule that depends on *who is asking*, because
+only some names can be absolute:
+
+| name comes from | guarantee | `LV-PRIV-005` |
+|---|---|---|
+| `git ls-files` (tracked path) | always repository-relative | not applied — a directory legitimately called `docs/home/<user>/` is not a home directory |
+| archive member name | none; chosen by whoever built the archive | applied, **anchored** — `/home/<user>/x` is flagged, relative `home/<user>/x` is not |
+
+Callers state which case they are in explicitly, because guessing wrong is a
+detection gap in one direction and a false positive in the other.
 
 Because a name can *be* the prohibited value, scanner output never prints a
 location verbatim. Each path component is checked, and an unsafe component is
@@ -265,12 +285,25 @@ replaced by a stable one-way marker:
 
 ```text
 docs/<redacted-name:9f2c1a7b40de>/notes.md:0: LV-PRIV-004
+bundle.zip!/home/<redacted-name:2bd806c97f0e>/vault/secret.txt:0: LV-PRIV-005
 ```
 
-Safe components are preserved so the entry stays identifiable for remediation,
-the marker is deterministic for a given name, and the prohibited substring never
-reaches stdout, stderr, or CI logs. Error paths follow the same rule: the
-fail-closed `ScanError` message names no path at all.
+Two rules mean something only across a *sequence* of components rather than
+within one, and both are evaluated at that scope: a digest label may sit in one
+component with the digest in another, and `alice` is identifying only because
+`home` precedes it. Safe components are preserved so the entry stays
+identifiable for remediation, the marker is deterministic for a given name, and
+the prohibited substring never reaches stdout, stderr, or CI logs. Error paths
+follow the same rule: the fail-closed `ScanError` message names no path at all.
+
+**Rendered output is checked against the rules that produced it.** Every leak
+found in review so far had one shape — a value correctly detected, then
+reproduced by the code reporting it. So rather than testing instances,
+`test_rendered_output_never_trips_a_content_rule` renders a cross-product of
+location shapes and asserts each rendered chunk is itself judged clean under the
+strictest reading of the name rules. `LV-PRIV-006` is the single documented
+exception: it names a payload *category* (`conversations.json` is identical in
+every export and carries nothing user-specific), kept legible for remediation.
 
 ### Exemption philosophy
 
@@ -301,5 +334,9 @@ exempted.
   label at all, is indistinguishable from a public hash and is not flagged.
 - Obfuscated forms (e.g. an address written as `name [at] example.com`) are not
   matched; the false-positive cost of matching them is too high.
+- `LV-PRIV-005` on a *name* is **anchored**: an archive member called
+  `/home/<user>/x` is flagged, but a relative one called `home/<user>/x` is not.
+  A relative tree containing `home/` is ordinary inside an archive, and treating
+  it as a local path would false-positive on any tracked directory named `home`.
 - The scanner sees the **current tree only**. It cannot detect or remove values
   that already exist in git history — see "Redaction vs. history" above.
