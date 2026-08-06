@@ -1307,13 +1307,15 @@ def test_plaintext_named_bz2_is_still_scanned_as_text() -> None:
 
 
 def test_rendered_output_never_trips_a_content_rule() -> None:
-    """The property whose absence caused four separate leaks.
+    """Rendered output must not be judged unsafe by the rules that produced it.
 
-    Each round so far has had the same shape: a value is correctly *detected*
-    and then reproduced by the code that *reports* it. Rather than test one more
-    instance, assert the invariant over a cross-product of location shapes —
-    every rendered chunk must itself be judged clean, under the strictest
-    (non-repo-relative) reading of the same name rules that flagged the original.
+    Necessary but **not sufficient** — see
+    `test_rendered_output_never_preserves_the_identifying_value`, which exists
+    because this test alone passed while the username was being printed:
+    redacting the component that makes a rule fire (`home`) silences the rule
+    while preserving the secret (the username). A rule-level invariant can be
+    satisfied by destroying the evidence instead of the value, so the value-level
+    invariant is asserted separately.
 
     LV-PRIV-006 is the one documented exception: it names a payload *category*
     (`conversations.json` is identical in every export and carries nothing
@@ -1348,6 +1350,93 @@ def test_rendered_output_never_trips_a_content_rule() -> None:
                     ]
                     assert not residue, f"{location!r} rendered to unsafe {chunk!r}: {residue}"
     assert checked > 300
+
+
+# --- Regressions: one path, one representation --------------------------------
+# Absoluteness was decided from a slash-collapsed string while the renderer split
+# the uncollapsed one, so `//home/<user>/x` redacted `home` at index 2 and
+# printed the username. Both the leak and the fact that the rule-level invariant
+# stayed green are regression-tested here.
+
+_IDENTITY = "alice"  # the value that must never survive rendering
+_HOME_ROOT = "/ho" + "me"
+_USERS_ROOT = "/Us" + "ers"
+
+
+def _slash_variants() -> list[str]:
+    """The same local home path written with assorted slash runs."""
+    return [
+        f"{_HOME_ROOT}/{_IDENTITY}/vault/x.txt",
+        f"/{_HOME_ROOT}/{_IDENTITY}/vault/x.txt",
+        f"//{_HOME_ROOT}/{_IDENTITY}/vault/x.txt",
+        f"{_HOME_ROOT}//{_IDENTITY}/vault/x.txt",
+        f"{_HOME_ROOT}/{_IDENTITY}//vault/x.txt",
+        f"{_HOME_ROOT}/{_IDENTITY}/vault/",
+        f"/{_HOME_ROOT}/{_IDENTITY}/vault/",
+        f"{_USERS_ROOT}/{_IDENTITY}/x.txt",
+        f"/{_USERS_ROOT}/{_IDENTITY}/x.txt",
+        "C://Us" + f"ers/{_IDENTITY}/x.txt",
+        "C:/Us" + f"ers/{_IDENTITY}/x.txt",
+    ]
+
+
+def test_rendered_output_never_preserves_the_identifying_value() -> None:
+    """The value-level invariant: the username itself must not survive.
+
+    The rule-level invariant was blind to this. Redacting `home` removes the
+    trigger for LV-PRIV-005, so the rendered form is judged clean — while the
+    username it was supposed to hide is still in the output. Assert the value.
+    """
+    for path in _slash_variants():
+        for location in (path, f"bundle.zip!{path}", f"o.zip!i.zip!{path}"):
+            rendered = safe_location(location)
+            assert _IDENTITY not in rendered, f"{location!r} leaked via {rendered!r}"
+
+
+def test_slash_runs_do_not_shift_the_redacted_component() -> None:
+    # Every spelling of the same path must reduce to the same rendering, which
+    # is what "one representation" buys: no variant can index differently.
+    renderings = {
+        safe_location(p)
+        for p in _slash_variants()
+        if p.startswith(_HOME_ROOT) or p.startswith("/" + _HOME_ROOT)
+        if "vault/x.txt" in p
+    }
+    assert len(renderings) == 1, renderings
+    assert _IDENTITY not in renderings.pop()
+
+
+def test_slash_run_paths_are_still_detected() -> None:
+    for path in _slash_variants():
+        assert "LV-PRIV-005" in rules_for_name(path, repo_relative=False), path
+
+
+def test_cli_output_excludes_username_with_slash_runs() -> None:
+    for member in (
+        f"/{_HOME_ROOT}/{_IDENTITY}/vault/x.txt",
+        f"{_HOME_ROOT}//{_IDENTITY}/vault/x.txt",
+    ):
+        rc, out, err = _run_cli_repo({"bundle.zip": _zip_with_entries([(member, b"x")])})
+        assert rc == 1
+        assert _IDENTITY not in out and _IDENTITY not in err, member
+
+
+def test_identity_index_and_absoluteness_agree() -> None:
+    # The two questions are answered by one function, so they cannot disagree.
+    # Assert that directly, including on the shapes that must stay negative.
+    for path in _slash_variants():
+        components = privacy_scan._path_components(path)
+        assert privacy_scan._identity_component_index(components) is not None
+        assert privacy_scan._is_absolute_local_path(path)
+    for path in (_FAKE_REPO_HOME_PATH, "home/alice/x.txt", f"{_HOME_ROOT}/{_IDENTITY}"):
+        assert not privacy_scan._is_absolute_local_path(path), path
+
+
+def test_home_path_without_trailing_component_is_not_flagged() -> None:
+    # Parity with the content rule, which requires a trailing `/`.
+    assert "LV-PRIV-005" not in rules_for_name(
+        f"{_HOME_ROOT}/{_IDENTITY}", repo_relative=False
+    )
 
 
 _TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]

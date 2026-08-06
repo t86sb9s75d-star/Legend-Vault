@@ -154,14 +154,49 @@ _LOCAL_PATH_WIN = re.compile(r"[A-Za-z]:\\Users\\", re.IGNORECASE)
 # `/home/<user>/vault/x` while leaving an ordinary relative member such as
 # `home/<user>/x` or `docs/home/<user>/notes.md` alone, since a directory tree
 # containing `home/` is unremarkable inside an archive.
-_ABS_LOCAL_POSIX = re.compile(r"^(?:/home/|/Users/)[A-Za-z0-9._-]+/")
-_ABS_LOCAL_WIN = re.compile(r"^[A-Za-z]:/Users/[A-Za-z0-9._-]+/", re.IGNORECASE)
+_SLASH_RUN = re.compile(r"/{2,}")
+_WIN_DRIVE = re.compile(r"^[A-Za-z]:$")
+_LOCAL_USER = re.compile(r"^[A-Za-z0-9._-]+$")  # same charset as _LOCAL_PATH_POSIX
+_LOCAL_USER_INDEX = 2  # ["", "home", "<user>", …] and ["C:", "Users", "<user>", …]
+
+
+def _path_components(name: str) -> list[str]:
+    """The one canonical component list for a `/`-normalized name.
+
+    Runs of slashes collapse, so a single path has a single representation.
+    Everything downstream — the absoluteness decision, the identity index, and
+    the rendered output — is derived from this one list.
+    """
+    return _SLASH_RUN.sub("/", name).split("/")
+
+
+def _identity_component_index(components: list[str]) -> int | None:
+    """Index of the user-identifying component, or None if not a local home path.
+
+    This is the single source of truth for both questions — *is* this an
+    absolute local path, and *which* component names the user. Deciding those
+    from two separate representations is precisely what allowed `//home/<user>/y` to
+    be judged absolute from a collapsed string while the renderer split the
+    uncollapsed one, redacting `home` and printing the username: the rule went
+    quiet because its trigger was destroyed, and the secret survived.
+    """
+    if len(components) <= _LOCAL_USER_INDEX + 1:
+        # A trailing component is required, matching the content rule's trailing
+        # `/`: `/home/<user>` alone is not treated as a home path.
+        return None
+    root, second = components[0], components[1]
+    if not _LOCAL_USER.match(components[_LOCAL_USER_INDEX]):
+        return None
+    if root == "" and second in ("home", "Users"):
+        return _LOCAL_USER_INDEX
+    if _WIN_DRIVE.match(root) and second.lower() == "users":
+        return _LOCAL_USER_INDEX
+    return None
 
 
 def _is_absolute_local_path(normalized: str) -> bool:
     """True when a `/`-normalized name denotes an absolute local home path."""
-    collapsed = re.sub(r"/{2,}", "/", normalized)
-    return bool(_ABS_LOCAL_POSIX.match(collapsed) or _ABS_LOCAL_WIN.match(collapsed))
+    return _identity_component_index(_path_components(normalized)) is not None
 
 # Known raw-export payload filenames (matched against a basename).
 _PAYLOAD_NAME = re.compile(
@@ -273,28 +308,6 @@ def _component_is_unsafe(component: str) -> bool:
     )
 
 
-_LOCAL_USER_INDEX = 2  # ["", "home", "<user>", …] and ["C:", "Users", "<user>", …]
-
-
-def _identity_component_index(chunk: str) -> int | None:
-    """Index of the user-identifying component of an absolute local home path.
-
-    ``/home/<user>/vault/x`` and ``C:/Users/<user>/x`` both put the username at
-    index 2 once split on ``/``. Only that component is redacted: ``home``,
-    ``Users`` and the drive letter carry no identity, so the entry stays
-    locatable for remediation while the correlatable part is gone. Redacting the
-    username is sufficient rather than minimal — the rendered form no longer
-    matches the rule that flagged it, which is asserted directly by
-    ``test_rendered_output_never_trips_a_content_rule``.
-
-    The backslash form never splits on ``/``, so it stays a single component and
-    is redacted wholesale by ``_component_is_unsafe``.
-    """
-    if not _is_absolute_local_path(chunk.replace("\\", "/")):
-        return None
-    return _LOCAL_USER_INDEX
-
-
 def safe_location(location: str) -> str:
     """Render a path / archive-member location without reproducing a prohibited
     value. Safe components are preserved; an unsafe component is replaced by a
@@ -310,16 +323,24 @@ def safe_location(location: str) -> str:
     readable.
 
     An absolute local home path is the other shape whose meaning lives in the
-    component *sequence* rather than in any one component: ``alice`` is only
+    component *sequence* rather than in any one component: the username is only
     identifying because ``home`` precedes it. ``_identity_component_index``
-    supplies that position.
+    supplies that position, reading the same canonical component list that is
+    rendered here — runs of slashes are collapsed, so ``//home/<user>/y`` and
+    ``/home/<user>/y`` cannot disagree about which component holds the username.
+    Collapsing is mildly lossy for display and deliberately so: an output that
+    is already non-verbatim by design gains nothing from preserving a slash run,
+    and one representation is worth more than an exact one.
     """
     location_has_digest_context = bool(_DIGEST_CONTEXT.search(location))
     rendered: list[str] = []
     for chunk in location.split("!"):
-        identity = _identity_component_index(chunk)
+        # Both the decision and the rendering read this one component list, so a
+        # repeated slash cannot shift the index out from under the redaction.
+        components = _path_components(chunk)
+        identity = _identity_component_index(components)
         parts = []
-        for index, component in enumerate(chunk.split("/")):
+        for index, component in enumerate(components):
             if (
                 index == identity
                 or _component_is_unsafe(component)
@@ -732,7 +753,7 @@ def _scan_single_stream(
 ) -> list[Finding]:
     inner = _decompress_charged(data, kind, budget)
     if inner is None:
-        return [Finding(display_path, "LV-PRIV-007", 0, note=f"undecompressable {kind}")]
+        return [Finding(display_path, "LV-PRIV-007", 0, note=f"undecompressible {kind}")]
     member_display = f"{display_path}!<{kind}-stream>"
     return _scan_member(member_display, inner, depth, budget)
 
