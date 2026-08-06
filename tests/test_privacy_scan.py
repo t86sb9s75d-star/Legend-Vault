@@ -1439,6 +1439,66 @@ def test_home_path_without_trailing_component_is_not_flagged() -> None:
     )
 
 
+# --- Regressions: magic-byte checks must be reachable -------------------------
+# _SIG_RAR held 7-byte constants while detect_archive() compared data[:8], so
+# both were unreachable and RAR was recognised by extension alone. A RAR without
+# a .rar name was read as ordinary bytes — a silent miss, its payload still
+# compressed. The existing unsupported-formats test passed throughout because it
+# used .rar filenames, exercising the extension path rather than the signature.
+
+_RAR4_SIG = b"Rar!\x1a\x07\x00"
+_RAR5_SIG = b"Rar!\x1a\x07\x01\x00"
+
+
+def test_rar4_detected_by_signature_without_extension() -> None:
+    assert detect_archive(_RAR4_SIG + b"\x00" * 64, "notes.md") == "unsupported"
+
+
+def test_rar5_detected_by_signature_without_extension() -> None:
+    assert detect_archive(_RAR5_SIG + b"\x00" * 64, "notes.md") == "unsupported"
+
+
+def test_rar_detected_by_signature_with_no_name() -> None:
+    assert detect_archive(_RAR4_SIG + b"\x00" * 64, "") == "unsupported"
+
+
+def test_cli_fails_closed_on_disguised_rar() -> None:
+    rc, out, err = _run_cli_repo({"payload.bin": _RAR4_SIG + b"\x00" * 512})
+    assert rc == 1
+    assert "LV-PRIV-007" in out
+
+
+def test_every_archive_signature_is_reachable() -> None:
+    """The structural guard: a signature constant that no comparison can match
+    is a silent hole, and inspection is how it survived. Assert reachability by
+    construction instead — a buffer beginning with each declared signature must
+    be recognised as *some* archive kind.
+    """
+    signatures = (
+        privacy_scan._SIG_ZIP,
+        privacy_scan._SIG_GZIP,
+        privacy_scan._SIG_BZIP2,
+        privacy_scan._SIG_XZ,
+        privacy_scan._SIG_7Z,
+        privacy_scan._SIG_RAR,
+    )
+    checked = 0
+    for declared in signatures:
+        for signature in declared if isinstance(declared, tuple) else (declared,):
+            checked += 1
+            kind = detect_archive(signature + b"\x00" * 128, "")
+            assert kind is not None, f"unreachable signature {signature!r}"
+    assert checked >= 8
+
+
+def test_signature_detection_precedes_extension() -> None:
+    # "Signature first, extension second" must hold for the unsupported formats
+    # too: a disguised archive cannot launder itself through a benign name.
+    for signature in (_RAR4_SIG, _RAR5_SIG, b"7z\xbc\xaf\x27\x1c"):
+        for name in ("notes.md", "data.txt", "image.png", ""):
+            assert detect_archive(signature + b"\x00" * 64, name) == "unsupported"
+
+
 _TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
 
 

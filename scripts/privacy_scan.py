@@ -475,7 +475,7 @@ _SIG_GZIP = b"\x1f\x8b"
 _SIG_BZIP2 = b"BZh"
 _SIG_XZ = b"\xfd7zXZ\x00"
 _SIG_7Z = b"7z\xbc\xaf\x27\x1c"
-_SIG_RAR = (b"Rar!\x1a\x07\x00", b"Rar!\x1a\x07\x01")
+_SIG_RAR = (b"Rar!\x1a\x07\x00", b"Rar!\x1a\x07\x01\x00")  # RAR4, RAR5
 
 
 def detect_archive(data: bytes, name: str = "") -> str | None:
@@ -484,18 +484,26 @@ def detect_archive(data: bytes, name: str = "") -> str | None:
     Kinds: ``zip``, ``tar``, ``gzip``, ``bzip2``, ``xz``, or ``unsupported``
     (a recognised format this scanner will not parse). ``None`` means "not an
     archive", which is the only case that may be treated as ordinary bytes.
+
+    Every magic-byte test uses ``startswith``, never a fixed-width slice
+    compared against a constant. A slice states the signature's length in a
+    second place, and the two drifted: ``_SIG_RAR`` held 7-byte constants while
+    the comparison sliced 8 bytes, so both were unreachable and a RAR without a
+    ``.rar`` name was read as ordinary bytes — a silent miss, since its payload
+    stays compressed. ``startswith`` takes the length from the constant itself,
+    so signatures of any length can be added without a second edit.
     """
-    if data[:4] in _SIG_ZIP:
+    if data.startswith(_SIG_ZIP):
         return "zip"
-    if data[:2] == _SIG_GZIP:
+    if data.startswith(_SIG_GZIP):
         return "gzip"
-    if data[:3] == _SIG_BZIP2:
+    if data.startswith(_SIG_BZIP2):
         return "bzip2"
-    if data[:6] == _SIG_XZ:
+    if data.startswith(_SIG_XZ):
         return "xz"
-    if data[:6] == _SIG_7Z:
+    if data.startswith(_SIG_7Z):
         return "unsupported"
-    if data[:8] in _SIG_RAR:
+    if data.startswith(_SIG_RAR):
         return "unsupported"
     if len(data) > 262 and data[257:262] == b"ustar":
         return "tar"
