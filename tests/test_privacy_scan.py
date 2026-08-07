@@ -2024,6 +2024,96 @@ def test_scan_repository_rejects_an_unknown_source() -> None:
     raise AssertionError("an unknown scan source must fail closed")
 
 
+# --- Regression: an unreadable git object must be a finding, not a pass ------
+# _read_blob_bounded() ignored `git cat-file`'s exit status, so a missing or
+# corrupt object returned empty content that then scanned CLEAN — the scanner's
+# central invariant ("unscannable is a finding") inverted in the newest path.
+
+_ABSENT_SHA = "0" * 40  # well-formed, not in any object store
+
+
+def _index_repo_with_blob(content: bytes = b"hello\n") -> Path:
+    repo = Path(tempfile.mkdtemp(prefix="blob_"))
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "t@invalid"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=repo, check=True)
+    (repo / "a.txt").write_bytes(content)
+    subprocess.run(["git", "add", "-f", "a.txt"], cwd=repo, check=True)
+    return repo
+
+
+def test_missing_blob_is_reported_unreadable_not_empty() -> None:
+    repo = _index_repo_with_blob()
+    try:
+        data, oversized = privacy_scan._read_blob_bounded(repo, _ABSENT_SHA, 1024)
+        assert oversized is None, "a missing object must be unreadable, not empty"
+        assert data == b""
+    finally:
+        shutil.rmtree(repo, ignore_errors=True)
+
+
+def test_entry_with_missing_blob_fails_closed() -> None:
+    repo = _index_repo_with_blob()
+    try:
+        findings = privacy_scan.scan_index_entry("a.txt", "100644", _ABSENT_SHA, repo)
+        assert "LV-PRIV-007" in _ids(findings), "an unreadable object scanned clean"
+    finally:
+        shutil.rmtree(repo, ignore_errors=True)
+
+
+def test_malformed_blob_sha_fails_closed() -> None:
+    repo = _index_repo_with_blob()
+    try:
+        _, oversized = privacy_scan._read_blob_bounded(repo, "not-a-sha", 1024)
+        assert oversized is None
+    finally:
+        shutil.rmtree(repo, ignore_errors=True)
+
+
+def test_legitimately_empty_blob_is_clean_not_unreadable() -> None:
+    # The control that keeps the fix honest: empty content is a successful read
+    # and must stay distinguishable from a failed one.
+    repo = _index_repo_with_blob(b"")
+    try:
+        sha = subprocess.run(
+            ["git", "rev-parse", ":a.txt"], cwd=repo, capture_output=True, text=True
+        ).stdout.strip()
+        data, oversized = privacy_scan._read_blob_bounded(repo, sha, 1024)
+        assert oversized is False and data == b""
+        assert privacy_scan.scan_index_entry("a.txt", "100644", sha, repo) == []
+    finally:
+        shutil.rmtree(repo, ignore_errors=True)
+
+
+def test_oversized_blob_is_bounded_and_reported() -> None:
+    limit = 512
+    repo = _index_repo_with_blob(b"A" * (limit * 20))
+    try:
+        sha = subprocess.run(
+            ["git", "rev-parse", ":a.txt"], cwd=repo, capture_output=True, text=True
+        ).stdout.strip()
+        data, oversized = privacy_scan._read_blob_bounded(repo, sha, limit)
+        assert oversized is True and data == b""
+    finally:
+        shutil.rmtree(repo, ignore_errors=True)
+
+
+def test_repeated_blob_reads_do_not_raise() -> None:
+    # The reviewer also suspected proc.kill() could raise on an already-exited
+    # process. Measured across 50 trials of each ordering and 200 helper calls:
+    # it does not — CPython's send_signal() polls first and skips a reaped
+    # process. Kept as a guard rather than a fix, since no defect was found.
+    repo = _index_repo_with_blob()
+    try:
+        sha = subprocess.run(
+            ["git", "rev-parse", ":a.txt"], cwd=repo, capture_output=True, text=True
+        ).stdout.strip()
+        for _ in range(25):
+            assert privacy_scan._read_blob_bounded(repo, sha, 1024) == (b"hello\n", False)
+    finally:
+        shutil.rmtree(repo, ignore_errors=True)
+
+
 _TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
 
 

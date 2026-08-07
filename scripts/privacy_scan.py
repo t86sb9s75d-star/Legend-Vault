@@ -963,17 +963,34 @@ def _read_blob_bounded(root: Path, sha: str, limit: int) -> tuple[bytes, bool | 
         )
     except OSError:
         return b"", None
+
+    failed_read = False
     try:
-        data = proc.stdout.read(limit + 1) if proc.stdout else b""
+        with proc.stdout as stream:
+            data = stream.read(limit + 1)
     except OSError:
-        return b"", None
-    finally:
-        if proc.stdout:
-            proc.stdout.close()
+        data, failed_read = b"", True
+
+    oversized = len(data) > limit
+    # Signal only a process whose output is being abandoned; a fully drained
+    # stream leaves nothing to kill, and git has already exited on its own.
+    if oversized or failed_read:
         proc.kill()
-        proc.wait()
-    if len(data) > limit:
+    status = proc.wait()
+
+    if failed_read:
+        return b"", None
+    if oversized:
+        # A definite classification: the blob exceeded the bound. git's exit
+        # status is not consulted because the pipe was deliberately abandoned.
         return b"", True
+    if status != 0:
+        # git could not produce the blob — a missing or corrupt object. The
+        # earlier version ignored the exit status, so this returned empty
+        # content that then scanned as *clean*: an unreadable object silently
+        # became a passing entry, inverting the scanner's central invariant
+        # that unscannable is a finding.
+        return b"", None
     return data, False
 
 
