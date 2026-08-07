@@ -240,9 +240,25 @@ def _encode_total(text: str) -> bytes:
         return text.encode("utf-8", errors="backslashreplace")
 
 
+# C0 controls, DEL, and C1 controls. C1 can appear via the Latin-1 text view.
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
 def _printable(text: str) -> str:
-    """A form of ``text`` that is safe to write to stdout/stderr."""
-    return _encode_total(text).decode("utf-8", errors="replace")
+    """A form of ``text`` that is safe to write to stdout/stderr.
+
+    Encodable is not the same as printable. Findings are emitted one per line,
+    so a name carrying a newline splits one finding across two lines — and the
+    second line is attacker-chosen text that reads exactly like a finding. A
+    carriage return can overwrite a real finding in a terminal, and an ANSI
+    escape can colour it into invisibility. Control characters are therefore
+    escaped, not merely encoded.
+
+    Verified before the fix: a ZIP member name containing a newline made the CLI
+    print two finding lines from one finding, the second a fabricated rule id.
+    """
+    decoded = _encode_total(text).decode("utf-8", errors="replace")
+    return _CONTROL_CHARS.sub(lambda m: f"\\x{ord(m.group()):02x}", decoded)
 
 
 def _line_digest(line: str) -> str:
@@ -505,7 +521,7 @@ def detect_archive(data: bytes, name: str = "") -> str | None:
         return "unsupported"
     if data.startswith(_SIG_RAR):
         return "unsupported"
-    if len(data) > 262 and data[257:262] == b"ustar":
+    if len(data) >= 262 and data[257:262] == b"ustar":
         return "tar"
     lowered = name.lower()
     if lowered.endswith((".7z", ".rar")):
@@ -789,7 +805,16 @@ def scan_tracked_entry(rel_path: str, abs_path: Path) -> list[Finding]:
         except OSError:
             return findings + [Finding(rel_path, "LV-PRIV-007", 0, note="unreadable link")]
         findings.extend(scan_text(rel_path, target))
-        findings.extend(Finding(rel_path, rid, 0) for rid in rules_for_name(target))
+        # repo_relative=False: a link target is not a repository path. It is an
+        # arbitrary string that may name an absolute location, exactly like a
+        # tar linkname. Leaving it True disabled the anchored check, and the
+        # content rules alone do not cover every spelling — `c:/users/<user>/x`
+        # matched neither the case-sensitive POSIX pattern nor the
+        # backslash-only Windows one, and went undetected end to end.
+        findings.extend(
+            Finding(rel_path, rid, 0)
+            for rid in rules_for_name(target, repo_relative=False)
+        )
         return findings
 
     if abs_path.is_dir():

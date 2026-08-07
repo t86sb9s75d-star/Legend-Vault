@@ -1583,6 +1583,88 @@ def test_scan_archive_still_fails_closed_on_unsupported_formats() -> None:
         assert "LV-PRIV-007" in _ids(scan_archive(name, data))
 
 
+# --- Regressions: output is one line per finding, always ----------------------
+# _printable() guaranteed encodability, not printability. A name carrying a
+# newline split one finding across two lines, the second being attacker-chosen
+# text that reads exactly like a finding; CR could overwrite a real finding in a
+# terminal and ANSI escapes could hide one.
+
+_FORGED = "real" + chr(10) + "bundle.zip:0: LV-PRIV-999 FORGED" + chr(10) + "x.txt"
+
+
+def test_control_characters_are_escaped_in_rendered_locations() -> None:
+    rendered = safe_location(_FORGED)
+    assert "\n" not in rendered and "\r" not in rendered and "\x1b" not in rendered
+    assert "\\x0a" in rendered
+
+
+def test_all_c0_and_c1_controls_are_escaped() -> None:
+    for code in list(range(0x00, 0x20)) + [0x7F] + list(range(0x80, 0xA0)):
+        rendered = safe_location(f"a{chr(code)}b.md")
+        assert chr(code) not in rendered, f"U+{code:04X} survived rendering"
+
+
+def test_cli_emits_one_line_per_finding_despite_newline_in_member_name() -> None:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr(_FORGED, ("contact " + _FAKE_EMAIL).encode())
+    rc, out, err = _run_cli_repo({"bundle.zip": buf.getvalue()})
+    assert rc == 1
+    finding_lines = [line for line in out.splitlines() if ": LV-PRIV-" in line]
+    assert len(finding_lines) == 1, f"one finding produced {len(finding_lines)} lines"
+    combined = out + err
+    assert not any(
+        char in combined for char in ("\r", "\x1b", "\t")
+    ), "raw control characters reached output"
+
+
+# --- Regression: a symlink target is not a repository path --------------------
+
+
+def test_symlink_target_with_lowercase_drive_path_is_detected() -> None:
+    """scan_tracked_entry() judged link targets as repo-relative, which disabled
+    the anchored absolute check. The content rules alone did not cover every
+    spelling: the POSIX pattern is case-sensitive and the Windows pattern only
+    matches backslashes, so a lowercase forward-slash drive path escaped both.
+    """
+    target = "c:/us" + "ers/alice/vault/x.txt"
+    with tempfile.TemporaryDirectory() as d:
+        link = Path(d) / "lnk"
+        link.symlink_to(target)
+        assert "LV-PRIV-005" in _ids(scan_tracked_entry("lnk", link))
+
+
+def test_symlink_target_spellings_are_all_detected() -> None:
+    users = "Us" + "ers"
+    targets = [
+        "C:" + chr(92) + users + chr(92) + "alice" + chr(92) + "x.txt",
+        "C:/" + users + "/alice/x.txt",
+        "c:/" + users.lower() + "/alice/x.txt",
+        "c:" + chr(92) + users.lower() + chr(92) + "alice" + chr(92) + "x.txt",
+        _FAKE_HOME + "/x.txt",
+    ]
+    for target in targets:
+        with tempfile.TemporaryDirectory() as d:
+            link = Path(d) / "lnk"
+            link.symlink_to(target)
+            assert "LV-PRIV-005" in _ids(scan_tracked_entry("lnk", link)), target
+
+
+# --- Regression: the tar length guard matches the slice it guards -------------
+
+
+def test_tar_signature_detected_at_minimum_length() -> None:
+    # data[257:262] is valid once len(data) >= 262; the guard demanded 263.
+    header = bytearray(262)
+    header[257:262] = b"ustar"
+    assert detect_archive(bytes(header), "") == "tar"
+
+
+def test_tar_signature_guard_does_not_overreach() -> None:
+    # One byte short, the slice cannot contain the signature and must not match.
+    assert detect_archive(bytes(261), "") is None
+
+
 _TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
 
 
