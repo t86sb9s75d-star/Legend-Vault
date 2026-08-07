@@ -21,6 +21,7 @@ import gzip
 import io
 import lzma
 import os
+import re
 import subprocess
 import sys
 import tarfile
@@ -1663,6 +1664,62 @@ def test_tar_signature_detected_at_minimum_length() -> None:
 def test_tar_signature_guard_does_not_overreach() -> None:
     # One byte short, the slice cannot contain the signature and must not match.
     assert detect_archive(bytes(261), "") is None
+
+
+# --- Guards: documented commands must be runnable -----------------------------
+# A report that names a file which is not in the tree cannot be reproduced, and
+# an unrunnable reproduction reads exactly like a reproducible one.
+
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[1]
+
+
+def _tracked() -> list[str]:
+    out = subprocess.run(
+        ["git", "ls-files"], cwd=_repo_root(), capture_output=True, text=True, check=True
+    )
+    return out.stdout.splitlines()
+
+
+def test_documented_commands_name_files_that_exist() -> None:
+    tracked = set(_tracked())
+    for doc in ("LegendVault_Stress_Test_Report_v2.md", "docs/PRIVATE_DATA_BOUNDARY.md"):
+        text = (_repo_root() / doc).read_text(errors="replace")
+        for match in re.finditer(r"^\s*python3?\s+(\"[^\"]+\"|\S+)", text, re.MULTILINE):
+            named = match.group(1).strip('"')
+            if named.startswith("-"):
+                continue
+            assert named in tracked, f"{doc} runs {named!r}, which is not tracked"
+
+
+def test_documented_commands_use_python3() -> None:
+    for doc in ("LegendVault_Stress_Test_Report_v2.md", "docs/PRIVATE_DATA_BOUNDARY.md"):
+        text = (_repo_root() / doc).read_text(errors="replace")
+        for line in text.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("python "):
+                raise AssertionError(f"{doc}: {stripped!r} depends on a bare `python`")
+
+
+# --- Property pinned after a disproven report: .lzma streams are inspected ----
+# A review claimed LZMAFile defaults to FORMAT_XZ, which would make an intact
+# LZMA-alone stream unscannable. Measured: the read default is FORMAT_AUTO and
+# such a stream is inspected. The property is worth pinning anyway, so that
+# passing an explicit format later cannot silently make .lzma opaque.
+
+
+def test_intact_lzma_alone_stream_is_inspected() -> None:
+    payload = (("contact " + _FAKE_EMAIL + "\n") * 50).encode()
+    blob = lzma.compress(payload, format=lzma.FORMAT_ALONE)
+    assert detect_archive(blob, "payload.lzma") == "xz"
+    assert "LV-PRIV-004" in _ids(scan_archive("payload.lzma", blob, kind="xz"))
+
+
+def test_intact_xz_stream_is_inspected() -> None:
+    payload = (("contact " + _FAKE_EMAIL + "\n") * 50).encode()
+    blob = lzma.compress(payload, format=lzma.FORMAT_XZ)
+    assert "LV-PRIV-004" in _ids(scan_archive("payload.xz", blob))
 
 
 _TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]

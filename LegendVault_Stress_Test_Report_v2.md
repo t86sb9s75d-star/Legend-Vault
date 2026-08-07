@@ -6,8 +6,12 @@
 
 - **Source archive:** `<private export archive — redacted>`
 - **Source SHA-256:** `<redacted>`
-- **Verifier:** `legend_vault_verify.py` v0.1.0
+- **Verifier at the time of the run:** `legend_vault_verify.py` v0.1.0
 - **Verifier SHA-256:** `<redacted>`
+- **Verifier in this tree today:** `legend_vault_verify (MODEL 2.0).py` v0.1.1.
+  The file was renamed and revised after this run, so the command below names
+  the file that exists now. The measurements above are from v0.1.0 and are **not**
+  re-attributed to v0.1.1; re-running today may legitimately differ.
 - **Standard-library only:** Yes
 
 ## Corrections to Revision 1
@@ -79,7 +83,7 @@ event stream. Anyone holding the private export can reproduce them locally.
 ## Reproducible command
 
 ```bash
-python legend_vault_verify.py "<private export archive — redacted>" \
+python3 "legend_vault_verify (MODEL 2.0).py" "<private export archive — redacted>" \
   --fault-test \
   --json-out reproduced-results.json
 ```
