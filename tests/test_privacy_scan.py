@@ -18,7 +18,9 @@ from __future__ import annotations
 
 import bz2
 import gzip
+import hashlib
 import io
+import shutil
 import lzma
 import os
 import re
@@ -1720,6 +1722,306 @@ def test_intact_xz_stream_is_inspected() -> None:
     payload = (("contact " + _FAKE_EMAIL + "\n") * 50).encode()
     blob = lzma.compress(payload, format=lzma.FORMAT_XZ)
     assert "LV-PRIV-004" in _ids(scan_archive("payload.xz", blob))
+
+
+# =============================================================================
+# OWNER-REVIEW REGRESSIONS
+# Three findings raised by independent owner review that twelve automated review
+# rounds did not surface.
+# =============================================================================
+
+# --- O1: the redaction marker must not be derived from the value -------------
+# safe_location() published sha256(component)[:12] — a 48-bit fingerprint OF THE
+# SECRET. Anyone holding a candidate could hash it and confirm the match, and the
+# same value produced the same marker everywhere, linking occurrences. That is
+# the correlatable identifier this repository's own policy prohibits, and the
+# exact shape LV-PRIV-002 exists to flag.
+
+_O1_SECRET = f"{_FAKE_EMAIL}-notes.md"
+
+
+def _sha_markers(component: str) -> list[str]:
+    digest = hashlib.sha256(component.encode("utf-8", errors="surrogatepass")).hexdigest()
+    return [digest, digest[:12]]
+
+
+def test_marker_is_not_recomputable_from_a_candidate_value() -> None:
+    rendered = safe_location(f"docs/{_O1_SECRET}")
+    assert _O1_SECRET not in rendered
+    for marker in _sha_markers(_O1_SECRET):
+        assert marker not in rendered, "a guesser could confirm the value from the output"
+
+
+def test_marker_is_not_a_stable_value_derived_fingerprint() -> None:
+    # The same secret in two unrelated locations must not yield a shared token
+    # that links the two findings together.
+    first = safe_location(f"docs/{_O1_SECRET}")
+    second = safe_location(f"other/dir/deeper/{_O1_SECRET}")
+    for marker in _sha_markers(_O1_SECRET):
+        assert marker not in first and marker not in second
+
+
+def test_marker_is_positional_not_content_derived() -> None:
+    # Two *different* secrets at the same position render identically; the marker
+    # therefore carries no information about what it hides.
+    one = safe_location(f"docs/{_FAKE_EMAIL}-a.md")
+    two = safe_location(f"docs/{_FAKE_GH_TOKEN}.md")
+    assert one == two
+    # …and position is what distinguishes markers within one location.
+    both = safe_location(f"{_FAKE_EMAIL}-a.md/{_FAKE_GH_TOKEN}.md")
+    assert "<redacted-name:1>" in both and "<redacted-name:2>" in both
+
+
+def test_cli_output_contains_no_digest_of_a_prohibited_value() -> None:
+    rc, out, err = _run_cli_repo({f"docs/{_O1_SECRET}": b"safe"})
+    assert rc == 1
+    combined = out + err
+    assert _O1_SECRET not in combined
+    for marker in _sha_markers(_O1_SECRET):
+        assert marker not in combined
+
+
+def test_no_sixty_four_hex_token_is_ever_emitted_for_a_redacted_name() -> None:
+    # A blanket check: rendered output must not contain any full-length digest,
+    # whichever unkeyed hash a future edit might reach for.
+    for location in (f"docs/{_O1_SECRET}", f"bundle.zip!{_FAKE_HOME}/x", _FAKE_EXPORT_ZIP):
+        rendered = safe_location(location)
+        assert not re.search(r"[0-9a-fA-F]{32,}", rendered), rendered
+
+
+# --- O2: the top-level size limit must bound the read, not follow it ---------
+
+
+class _CountingFile(io.RawIOBase):
+    """Counts bytes actually delivered by the real file object."""
+
+    def __init__(self, inner, counter):
+        self._inner = inner
+        self._counter = counter
+
+    def read(self, size=-1):
+        chunk = self._inner.read(size)
+        self._counter["n"] += len(chunk)
+        return chunk
+
+    def readable(self) -> bool:
+        return True
+
+    def close(self) -> None:
+        try:
+            self._inner.close()
+        finally:
+            super().close()
+
+
+def _measure_file_read(path: Path, limit: int):
+    """Scan one tracked file under a shrunken bound, counting real bytes read.
+
+    The count comes from the file object, not from any accounting inside the
+    scanner — the production path has no counter of its own to trust.
+    """
+    counter = {"n": 0}
+    real_open = Path.open
+    real_read_bytes = Path.read_bytes
+    saved = privacy_scan._MAX_MEMBER_BYTES
+    privacy_scan._MAX_MEMBER_BYTES = limit
+
+    def counting_open(self, *a, **kw):
+        mode = a[0] if a else kw.get("mode", "r")
+        handle = real_open(self, *a, **kw)
+        return _CountingFile(handle, counter) if "b" in mode else handle
+
+    def counting_read_bytes(self):
+        with counting_open(self, "rb") as fh:
+            return fh.read()
+
+    Path.open = counting_open
+    Path.read_bytes = counting_read_bytes
+    try:
+        findings = scan_tracked_entry(path.name, path)
+    finally:
+        Path.open = real_open
+        Path.read_bytes = real_read_bytes
+        privacy_scan._MAX_MEMBER_BYTES = saved
+    return findings, counter["n"]
+
+
+def test_oversized_file_is_not_fully_read_before_being_rejected() -> None:
+    limit = 4096
+    with tempfile.TemporaryDirectory() as d:
+        big = Path(d) / "big.bin"
+        big.write_bytes(b"A" * (limit * 50))
+        findings, consumed = _measure_file_read(big, limit)
+    assert "LV-PRIV-007" in _ids(findings)
+    assert consumed <= limit + 1, f"read {consumed} bytes to reject a {limit}-byte limit"
+
+
+def test_file_exactly_at_the_limit_is_scanned() -> None:
+    limit = 4096
+    body = ("contact " + _FAKE_EMAIL).encode()
+    with tempfile.TemporaryDirectory() as d:
+        exact = Path(d) / "exact.txt"
+        exact.write_bytes(body + b"." * (limit - len(body)))
+        findings, consumed = _measure_file_read(exact, limit)
+    assert "LV-PRIV-004" in _ids(findings)
+    assert consumed <= limit + 1
+
+
+def test_file_one_byte_over_the_limit_fails_closed() -> None:
+    limit = 4096
+    with tempfile.TemporaryDirectory() as d:
+        over = Path(d) / "over.txt"
+        over.write_bytes(b"B" * (limit + 1))
+        findings, consumed = _measure_file_read(over, limit)
+    assert "LV-PRIV-007" in _ids(findings)
+    assert consumed <= limit + 1
+
+
+def test_bounded_file_read_is_deterministic() -> None:
+    limit = 2048
+    with tempfile.TemporaryDirectory() as d:
+        target = Path(d) / "f.bin"
+        target.write_bytes(b"C" * (limit * 10))
+        first = _measure_file_read(target, limit)
+        second = _measure_file_read(target, limit)
+    assert first[0] == second[0] and first[1] == second[1]
+
+
+def test_unreadable_file_is_reported_not_crashed() -> None:
+    with tempfile.TemporaryDirectory() as d:
+        missing = Path(d) / "gone.txt"
+        assert "LV-PRIV-007" in _ids(scan_tracked_entry("gone.txt", missing))
+
+
+# --- O3: staged mode judges the index, worktree mode judges the worktree -----
+
+
+def _staged_repo(staged: dict, worktree: dict | None = None) -> Path:
+    """Build a repo where staged content and worktree content can differ."""
+    repo = Path(tempfile.mkdtemp(prefix="staged_"))
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "t@invalid"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=repo, check=True)
+    for rel, data in staged.items():
+        target = repo / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+        subprocess.run(["git", "add", "-f", rel], cwd=repo, check=True)
+    for rel, data in (worktree or {}).items():
+        (repo / rel).write_bytes(data)   # diverge AFTER staging
+    return repo
+
+
+def _scan_modes(repo: Path):
+    def run(args):
+        return subprocess.run(
+            [sys.executable, str(_SCANNER), *args], cwd=repo, capture_output=True, text=True
+        )
+    return run([]), run(["--staged"])
+
+
+def test_staged_prohibited_value_is_detected_even_when_worktree_is_safe() -> None:
+    """CASE A — the commit would carry the value; the worktree hides it."""
+    repo = _staged_repo(
+        staged={"notes.md": ("contact " + _FAKE_EMAIL).encode()},
+        worktree={"notes.md": b"nothing to see here\n"},
+    )
+    try:
+        worktree_run, staged_run = _scan_modes(repo)
+        assert staged_run.returncode == 1, "staged mode missed a staged prohibited value"
+        assert "LV-PRIV-004" in staged_run.stdout
+        assert _FAKE_EMAIL not in staged_run.stdout + staged_run.stderr
+        # Worktree mode answers about the worktree, which is genuinely clean.
+        assert worktree_run.returncode == 0
+    finally:
+        shutil.rmtree(repo, ignore_errors=True)
+
+
+def test_staged_mode_ignores_unstaged_worktree_content() -> None:
+    """CASE B — the value exists only on disk and is not part of the commit."""
+    repo = _staged_repo(
+        staged={"notes.md": b"nothing to see here\n"},
+        worktree={"notes.md": ("contact " + _FAKE_EMAIL).encode()},
+    )
+    try:
+        worktree_run, staged_run = _scan_modes(repo)
+        assert staged_run.returncode == 0, "staged mode judged unstaged content"
+        assert worktree_run.returncode == 1
+    finally:
+        shutil.rmtree(repo, ignore_errors=True)
+
+
+def test_staged_symlink_target_is_scanned_from_the_index() -> None:
+    repo = Path(tempfile.mkdtemp(prefix="staged_link_"))
+    try:
+        subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.email", "t@invalid"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.name", "t"], cwd=repo, check=True)
+        (repo / "lnk").symlink_to(_FAKE_PRIVATE_TARGET)
+        subprocess.run(["git", "add", "-f", "lnk"], cwd=repo, check=True)
+        # Diverge the worktree AFTER staging, so a worktree scan would see only
+        # the harmless target. Without this the test passes even when --staged
+        # is ignored, proving nothing about where the content came from.
+        (repo / "lnk").unlink()
+        (repo / "lnk").symlink_to("docs/harmless.md")
+        proc = subprocess.run(
+            [sys.executable, str(_SCANNER), "--staged"], cwd=repo,
+            capture_output=True, text=True,
+        )
+        assert proc.returncode == 1
+        assert "LV-PRIV-005" in proc.stdout
+        assert _FAKE_PRIVATE_TARGET not in proc.stdout + proc.stderr
+    finally:
+        shutil.rmtree(repo, ignore_errors=True)
+
+
+def test_staged_mode_handles_non_utf8_paths() -> None:
+    repo = Path(tempfile.mkdtemp(prefix="staged_raw_"))
+    try:
+        subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.email", "t@invalid"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.name", "t"], cwd=repo, check=True)
+        raw = b"staged-\xff-notes.md"
+        target = os.path.join(os.fsdecode(repo), os.fsdecode(raw))
+        with open(os.fsencode(target), "wb") as fh:
+            fh.write(("contact " + _FAKE_EMAIL).encode())
+        subprocess.run(["git", "add", "-f", os.fsdecode(raw)], cwd=repo, check=True)
+        # Diverge the worktree so only the staged blob carries the value.
+        with open(os.fsencode(target), "wb") as fh:
+            fh.write(b"nothing to see here\n")
+        proc = subprocess.run(
+            [sys.executable, str(_SCANNER), "--staged"], cwd=repo,
+            capture_output=True, text=True,
+        )
+        assert proc.returncode == 1
+        assert "LV-PRIV-004" in proc.stdout
+    finally:
+        shutil.rmtree(repo, ignore_errors=True)
+
+
+def test_unknown_cli_argument_fails_closed() -> None:
+    # argv was previously ignored entirely, so `--staged` ran a worktree scan and
+    # exited 0 — the flag looked honoured while doing something else.
+    proc = subprocess.run(
+        [sys.executable, str(_SCANNER), "--nonsense"],
+        cwd=Path(__file__).resolve().parents[1], capture_output=True, text=True,
+    )
+    assert proc.returncode == 2
+    assert "unknown argument" in proc.stderr
+
+
+def test_pre_commit_hook_uses_staged_mode() -> None:
+    config = (Path(__file__).resolve().parents[1] / ".pre-commit-config.yaml").read_text()
+    entry = next(l for l in config.splitlines() if l.strip().startswith("entry:"))
+    assert "--staged" in entry, "the hook must judge the index, not the worktree"
+
+
+def test_scan_repository_rejects_an_unknown_source() -> None:
+    try:
+        privacy_scan.scan_repository(source="whatever")
+    except privacy_scan.ScanError:
+        return
+    raise AssertionError("an unknown scan source must fail closed")
 
 
 _TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]

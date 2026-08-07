@@ -10,7 +10,10 @@ repos:
         # `python` on PATH. The hook would then fail to start — a fail-closed
         # guard that never runs is the worst kind, so name the interpreter the
         # shebang already names.
-        entry: python3 scripts/privacy_scan.py
+        # --staged: judge what the commit will actually contain. Reading the
+        # working tree here would let a prohibited value be staged while a safe
+        # copy sits on disk, and the scan would pass.
+        entry: python3 scripts/privacy_scan.py --staged
         language: system
         pass_filenames: false
         always_run: true

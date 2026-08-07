@@ -11,7 +11,9 @@ tracked *text*.
 
 Design guarantees
 -----------------
-- Operates on **tracked files only** (``git ls-files``).
+- Operates on **tracked content only**, from an explicitly named source: the
+  working tree (default) or the **staged index** (``--staged``, used by the
+  pre-commit hook, which reads staged blobs from git rather than from disk).
 - Reads locally; never uploads content and never calls a network service.
 - **Never silently skips content.** Anything that cannot be decoded, parsed,
   read, or bounded becomes an explicit ``LV-PRIV-007`` finding rather than a
@@ -20,9 +22,10 @@ Design guarantees
 - **Recognised archive formats are inspected or rejected, never treated as
   ordinary bytes.** ZIP/TAR/GZIP/BZIP2/XZ are inspected in memory; formats that
   cannot be inspected without new dependencies (7z, RAR) yield ``LV-PRIV-007``.
-- **Output never reproduces a prohibited value** — not in file paths, directory
-  components, or archive member names. Unsafe components are replaced with a
-  stable ``<redacted-name:digest>`` marker so remediation is still possible.
+- **Output never reproduces a prohibited value, nor anything derived from it.**
+  Unsafe components are replaced with a ``<redacted-name:N>`` marker numbered by
+  position, so remediation is still possible while nothing published can be
+  recomputed from a guess at the secret.
 - **No file is exempt from every rule.** Exemptions are line-scoped and
   alteration-sensitive (see ``_LINE_EXEMPTIONS``).
 - Deterministic: fixed rule order, sorted output, no environment input.
@@ -327,7 +330,12 @@ def _component_is_unsafe(component: str) -> bool:
 def safe_location(location: str) -> str:
     """Render a path / archive-member location without reproducing a prohibited
     value. Safe components are preserved; an unsafe component is replaced by a
-    stable one-way marker so the entry remains identifiable for remediation.
+    positional marker so the entry remains identifiable for remediation.
+
+    The marker is **not** derived from the value it hides. Nothing published
+    here may be recomputable from a guess at the secret, which rules out any
+    unkeyed digest of the component — swapping SHA-256 for another hash would
+    preserve the defect, not fix it.
 
     Context is evaluated across the **whole location**, not per component. The
     digest rule is contextual, so a label can sit in one component while the
@@ -350,6 +358,7 @@ def safe_location(location: str) -> str:
     """
     location_has_digest_context = bool(_DIGEST_CONTEXT.search(location))
     rendered: list[str] = []
+    redacted_count = 0
     for chunk in location.split("!"):
         # Both the decision and the rendering read this one component list, so a
         # repeated slash cannot shift the index out from under the redaction.
@@ -362,8 +371,18 @@ def safe_location(location: str) -> str:
                 or _component_is_unsafe(component)
                 or (location_has_digest_context and _HEX64.search(component))
             ):
-                digest = hashlib.sha256(_encode_total(component)).hexdigest()[:12]
-                parts.append(f"<redacted-name:{digest}>")
+                # The ordinal is derived from POSITION, never from the component.
+                # This previously published sha256(component)[:12], which is a
+                # 48-bit fingerprint *of the private value*: anyone holding a
+                # candidate could hash it and confirm the match, and the same
+                # value produced the same marker everywhere, linking occurrences
+                # across the whole report. That is precisely the correlatable
+                # identifier this repository's own policy prohibits (see
+                # "Correlatable identifiers" in docs/PRIVATE_DATA_BOUNDARY.md,
+                # and rule LV-PRIV-002, which exists to flag exactly this shape).
+                # A positional ordinal cannot be recomputed from a guess.
+                redacted_count += 1
+                parts.append(f"<redacted-name:{redacted_count}>")
             else:
                 # Safe components are preserved, but still normalised so an
                 # undecodable byte cannot crash the caller that prints them.
@@ -792,6 +811,24 @@ def _scan_single_stream(
 # --- Tracked-entry scanning ---------------------------------------------------
 
 
+def _read_file_bounded(abs_path: Path, limit: int) -> tuple[bytes, bool | None]:
+    """Read at most ``limit + 1`` bytes from a file.
+
+    Returns ``(data, oversized)``. ``oversized is None`` means the file could not
+    be read at all. The single extra byte distinguishes "exactly at the limit"
+    from "over it" without consuming the remainder — the same sentinel discipline
+    ``_read_charged`` uses inside archives.
+    """
+    try:
+        with abs_path.open("rb") as handle:
+            data = handle.read(limit + 1)
+    except OSError:
+        return b"", None
+    if len(data) > limit:
+        return b"", True
+    return data, False
+
+
 def scan_tracked_entry(rel_path: str, abs_path: Path) -> list[Finding]:
     """Scan one tracked path. Name rules always run, even if content cannot be
     read, so a prohibited *name* is caught regardless of the entry's state."""
@@ -821,12 +858,18 @@ def scan_tracked_entry(rel_path: str, abs_path: Path) -> list[Finding]:
         # Submodule / gitlink: its contents are not part of this repository.
         return findings
 
-    try:
-        data = abs_path.read_bytes()
-    except OSError:
+    # Bounded read, never read_bytes(). The size limit used to be checked after
+    # the whole file was already in memory, so a large tracked file was fully
+    # consumed before being called oversized — measured at 40x a shrunken bound.
+    # That is the same "validate after consumption" class the archive budget was
+    # rebuilt around, surviving at the top level. A stat() first would still
+    # race, so the read itself is what must be bounded: at most
+    # _MAX_MEMBER_BYTES + 1 bytes, the extra byte only to tell "at the limit"
+    # from "over" it.
+    data, oversized = _read_file_bounded(abs_path, _MAX_MEMBER_BYTES)
+    if oversized is None:
         return findings + [Finding(rel_path, "LV-PRIV-007", 0, note="unreadable")]
-
-    if len(data) > _MAX_MEMBER_BYTES:
+    if oversized:
         return findings + [Finding(rel_path, "LV-PRIV-007", 0, note="oversized")]
 
     kind = detect_archive(data, rel_path)
@@ -873,9 +916,121 @@ def _tracked_files(root: Path) -> list[str]:
     return [p for p in decoded.split("\0") if p]
 
 
-def scan_repository() -> list[Finding]:
+# --- Index (staged) scanning --------------------------------------------------
+# Two different states exist and they are not interchangeable:
+#
+#   INDEX         what git will actually commit
+#   WORKING TREE  what happens to be on disk right now
+#
+# Enumerating one and reading the other is not a guarantee about either. It let a
+# file be staged with a prohibited value while the worktree copy was replaced
+# with safe text: the scan passed and the commit would have carried the value.
+# Each mode now names its own source of truth.
+
+_GITLINK_MODE = "160000"
+_SYMLINK_MODE = "120000"
+
+
+def _index_entries(root: Path) -> list[tuple[str, str, str]]:
+    """(mode, blob sha, path) for every entry in the index, from git itself."""
+    try:
+        out = subprocess.run(
+            ["git", "ls-files", "-s", "-z"], cwd=root, capture_output=True, check=True
+        )
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise ScanError("cannot enumerate the index (git ls-files -s failed)") from exc
+    entries: list[tuple[str, str, str]] = []
+    for record in out.stdout.decode("utf-8", errors="surrogateescape").split("\0"):
+        if not record:
+            continue
+        # "<mode> <sha> <stage>\t<path>"
+        meta, _, path = record.partition("\t")
+        fields = meta.split()
+        if len(fields) < 3 or not path:
+            raise ScanError("cannot parse the index (unexpected git ls-files -s output)")
+        entries.append((fields[0], fields[1], path))
+    return entries
+
+
+def _read_blob_bounded(root: Path, sha: str, limit: int) -> tuple[bytes, bool | None]:
+    """Read at most ``limit + 1`` bytes of a git blob, bounded like a file read."""
+    try:
+        proc = subprocess.Popen(
+            ["git", "cat-file", "blob", sha],
+            cwd=root,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError:
+        return b"", None
+    try:
+        data = proc.stdout.read(limit + 1) if proc.stdout else b""
+    except OSError:
+        return b"", None
+    finally:
+        if proc.stdout:
+            proc.stdout.close()
+        proc.kill()
+        proc.wait()
+    if len(data) > limit:
+        return b"", True
+    return data, False
+
+
+def scan_index_entry(rel_path: str, mode: str, sha: str, root: Path) -> list[Finding]:
+    """Scan one *staged* entry, taking both identity and content from git.
+
+    Nothing here touches the working tree, so a divergent on-disk copy cannot
+    make a staged value invisible.
+    """
+    findings: list[Finding] = [Finding(rel_path, rid, 0) for rid in rules_for_name(rel_path)]
+
+    if mode == _GITLINK_MODE:
+        # A submodule commit pointer; its contents are not part of this
+        # repository, exactly as in worktree mode.
+        return findings
+
+    data, oversized = _read_blob_bounded(root, sha, _MAX_MEMBER_BYTES)
+    if oversized is None:
+        return findings + [Finding(rel_path, "LV-PRIV-007", 0, note="unreadable blob")]
+    if oversized:
+        return findings + [Finding(rel_path, "LV-PRIV-007", 0, note="oversized")]
+
+    if mode == _SYMLINK_MODE:
+        # For a symlink git stores the target string as the blob content, so the
+        # staged target is scanned with the same rules the worktree path uses.
+        target = data.decode("utf-8", errors="surrogateescape")
+        findings.extend(scan_text(rel_path, target))
+        findings.extend(
+            Finding(rel_path, rid, 0)
+            for rid in rules_for_name(target, repo_relative=False)
+        )
+        return findings
+
+    kind = detect_archive(data, rel_path)
+    if kind is not None:
+        findings.extend(scan_archive(rel_path, data, kind=kind))
+        return findings
+
+    findings.extend(scan_bytes(rel_path, data, exempt_path=rel_path))
+    return findings
+
+
+def scan_repository(*, source: str = "worktree") -> list[Finding]:
+    """Scan the repository from an explicitly named source of truth.
+
+    ``source="worktree"`` enumerates tracked paths and reads them from disk.
+    ``source="index"`` reads staged identity *and* staged content from git, so
+    it judges what a commit would actually contain.
+    """
     root = _repo_root()
     findings: list[Finding] = []
+    if source == "index":
+        for mode, sha, rel in _index_entries(root):
+            findings.extend(scan_index_entry(rel, mode, sha, root))
+        return findings
+    if source != "worktree":
+        raise ScanError(f"unknown scan source: {source!r}")
     for rel in _tracked_files(root):
         findings.extend(scan_tracked_entry(rel, root / rel))
     return findings
@@ -892,9 +1047,27 @@ def _emit(line: str, *, stream=None) -> None:
         print(line.encode(encoding, errors="backslashreplace").decode(encoding), file=target)
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
+    # Arguments are parsed explicitly and an unknown one fails closed. Before
+    # this, argv was ignored entirely, so `--staged` silently ran an ordinary
+    # worktree scan and exited 0 — a flag that looks honoured while doing
+    # something else is worse than no flag.
+    args = list(sys.argv[1:] if argv is None else argv)
+    source = "worktree"
+    for arg in args:
+        if arg == "--staged":
+            source = "index"
+        elif arg == "--worktree":
+            source = "worktree"
+        else:
+            print(
+                f"PRIVACY SCAN FAILED: unknown argument {arg!r} "
+                f"(expected --staged or --worktree)",
+                file=sys.stderr,
+            )
+            return 2
     try:
-        findings = scan_repository()
+        findings = scan_repository(source=source)
     except ScanError as exc:
         # Fail closed: an unperformable scan is never a pass. The message names
         # no path, so it cannot leak an unsafe name.
@@ -910,7 +1083,8 @@ def main() -> int:
             file=sys.stderr,
         )
         return 1
-    print("privacy scan: no findings in tracked files.")
+    scanned = "staged index" if source == "index" else "tracked files"
+    print(f"privacy scan: no findings in {scanned}.")
     return 0
 
 

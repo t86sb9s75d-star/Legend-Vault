@@ -176,11 +176,28 @@ were removed and kept only in private audit records outside the repository.
 
 ## Preventive scanning
 
-`scripts/privacy_scan.py` is a deterministic, offline, fail-closed scanner over
-**tracked files** (`git ls-files`, so the index — including staged additions —
-is what gets scanned). It runs in CI and as a local pre-commit hook, reports
-only `path:line: RULE-ID` (never the matched value), and exits non-zero on any
-finding. Rules:
+`scripts/privacy_scan.py` is a deterministic, offline, fail-closed scanner that
+reports only `path:line: RULE-ID` (never the matched value) and exits non-zero on
+any finding.
+
+**It has two modes, and each names its own source of truth.** These are different
+states and are not interchangeable — the index is what git will commit, the
+working tree is what happens to be on disk right now:
+
+| Mode | Enumerates | Reads | Used by |
+|---|---|---|---|
+| `--worktree` (default) | `git ls-files` | the file on disk | CI, where the checkout matches the commit |
+| `--staged` | `git ls-files -s` | the **staged blob**, via `git cat-file` | the pre-commit hook |
+
+Earlier revisions enumerated the index and then read the working tree while
+claiming staged additions were covered. They were not: a file staged with a
+prohibited value whose on-disk copy was replaced with safe text passed the scan.
+Staged mode now takes both entry identity and content from git, so no divergent
+on-disk copy can hide a staged value, and it handles blobs, symlink targets
+(git stores the target as the blob), gitlinks, and non-UTF-8 paths. An unknown
+argument exits `2` rather than being ignored.
+
+Rules:
 
 - `LV-PRIV-001` private-export-identifier (real-export archive names)
 - `LV-PRIV-002` private-export-digest (a full SHA-256 near a source/export
@@ -281,19 +298,30 @@ detection gap in one direction and a false positive in the other.
 
 Because a name can *be* the prohibited value, scanner output never prints a
 location verbatim. Each path component is checked, and an unsafe component is
-replaced by a stable one-way marker:
+replaced by a **positional** marker — numbered by where it sits, never derived
+from what it contains:
 
 ```text
-docs/<redacted-name:9f2c1a7b40de>/notes.md:0: LV-PRIV-004
-bundle.zip!/home/<redacted-name:2bd806c97f0e>/vault/secret.txt:0: LV-PRIV-005
+docs/<redacted-name:1>/notes.md:0: LV-PRIV-004
+bundle.zip!/home/<redacted-name:1>/vault/secret.txt:0: LV-PRIV-005
 ```
+
+This marker used to be `sha256(component)[:12]`, and that was wrong on this
+document's own terms. A 48-bit digest of a private value is a **correlatable
+identifier**: anyone holding a candidate could hash it and confirm the match,
+and the same value produced the same marker everywhere, linking occurrences
+across a report. Substituting a different unkeyed hash would preserve the defect
+— the requirement is that nothing published be recomputable from a guess at the
+secret. A positional ordinal cannot be, so two different secrets in the same
+position render identically.
 
 Two rules mean something only across a *sequence* of components rather than
 within one, and both are evaluated at that scope: a digest label may sit in one
 component with the digest in another, and `alice` is identifying only because
 `home` precedes it. Safe components are preserved so the entry stays
-identifiable for remediation, the marker is deterministic for a given name, and
-the prohibited substring never reaches stdout, stderr, or CI logs. Error paths
+identifiable for remediation, the rendering is deterministic for a given
+*location*, and neither the prohibited substring nor any digest of it reaches
+stdout, stderr, or CI logs. Error paths
 follow the same rule: the fail-closed `ScanError` message names no path at all.
 
 **Rendered output is checked against the rules that produced it.** Every leak
