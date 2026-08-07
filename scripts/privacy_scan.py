@@ -882,7 +882,14 @@ def scan_tracked_entry(rel_path: str, abs_path: Path) -> list[Finding]:
 
 
 class ScanError(RuntimeError):
-    """The scan could not be performed at all (fail closed)."""
+    """The scan could not be performed at all (fail closed).
+
+    **Its message is printed verbatim to stderr by main(), so it must never be
+    built from a caller-supplied value.** Every message here is a fixed string
+    naming no path, no argument and no content. This is enforced structurally by
+    ``test_scan_error_messages_never_interpolate_a_value``, which parses this
+    module and rejects any ``ScanError`` constructed from an f-string.
+    """
 
 
 def _repo_root() -> Path:
@@ -1047,7 +1054,9 @@ def scan_repository(*, source: str = "worktree") -> list[Finding]:
             findings.extend(scan_index_entry(rel, mode, sha, root))
         return findings
     if source != "worktree":
-        raise ScanError(f"unknown scan source: {source!r}")
+        # Same rule as the CLI branch: main() prints ScanError text verbatim to
+        # stderr, so no ScanError may be built from a caller-supplied value.
+        raise ScanError("unknown scan source (expected 'worktree' or 'index')")
     for rel in _tracked_files(root):
         findings.extend(scan_tracked_entry(rel, root / rel))
     return findings
@@ -1077,9 +1086,14 @@ def main(argv: list[str] | None = None) -> int:
         elif arg == "--worktree":
             source = "worktree"
         else:
+            # The argument is NOT echoed. Everything this program writes is
+            # subject to the same rule, and an argument is caller-supplied text
+            # that may itself be a prohibited value — someone passing a private
+            # path by mistake must not have it reproduced in a terminal or CI
+            # log by the very tool that exists to prevent that.
             print(
-                f"PRIVACY SCAN FAILED: unknown argument {arg!r} "
-                f"(expected --staged or --worktree)",
+                "PRIVACY SCAN FAILED: unrecognised argument "
+                "(expected --staged or --worktree)",
                 file=sys.stderr,
             )
             return 2

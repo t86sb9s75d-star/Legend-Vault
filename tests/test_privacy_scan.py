@@ -24,6 +24,7 @@ import shutil
 import lzma
 import os
 import re
+import ast
 import subprocess
 import sys
 import tarfile
@@ -2007,7 +2008,10 @@ def test_unknown_cli_argument_fails_closed() -> None:
         cwd=Path(__file__).resolve().parents[1], capture_output=True, text=True,
     )
     assert proc.returncode == 2
-    assert "unknown argument" in proc.stderr
+    # Assert the property (rejected, and the caller's text is not echoed) rather
+    # than the exact prose, which changed once the message stopped quoting argv.
+    assert "PRIVACY SCAN FAILED" in proc.stderr
+    assert "--nonsense" not in proc.stdout + proc.stderr
 
 
 def test_pre_commit_hook_uses_staged_mode() -> None:
@@ -2112,6 +2116,70 @@ def test_repeated_blob_reads_do_not_raise() -> None:
             assert privacy_scan._read_blob_bounded(repo, sha, 1024) == (b"hello\n", False)
     finally:
         shutil.rmtree(repo, ignore_errors=True)
+
+
+# --- Regression: no error message echoes a caller-supplied value -------------
+# The CLI's unknown-argument branch printed {arg!r}, reproducing whatever was
+# passed. An argument is caller-supplied text that may itself be a prohibited
+# value, and the output-safety guarantee is unconditional — it does not stop at
+# the findings list. The same class existed in scan_repository()'s ScanError.
+
+
+def _cli(args):
+    return subprocess.run(
+        [sys.executable, str(_SCANNER), *args],
+        cwd=Path(__file__).resolve().parents[1], capture_output=True, text=True,
+    )
+
+
+def test_unknown_argument_is_not_echoed() -> None:
+    for value in (_FAKE_EMAIL, _FAKE_HOME, _FAKE_GH_TOKEN, _FAKE_EXPORT_ZIP):
+        proc = _cli([value])
+        assert proc.returncode == 2
+        assert value not in proc.stdout + proc.stderr, f"{value!r} was echoed"
+
+
+def test_unknown_argument_still_fails_closed() -> None:
+    # The fix must not turn a rejection into an acceptance.
+    proc = _cli(["--nonsense"])
+    assert proc.returncode == 2
+    assert "unrecognised argument" in proc.stderr
+
+
+def test_valid_modes_still_run() -> None:
+    for mode in ("--staged", "--worktree"):
+        assert _cli([mode]).returncode == 0
+
+
+def test_scan_repository_error_does_not_echo_its_argument() -> None:
+    try:
+        privacy_scan.scan_repository(source=_FAKE_HOME)
+    except privacy_scan.ScanError as exc:
+        assert _FAKE_HOME not in str(exc)
+        return
+    raise AssertionError("an unknown scan source must fail closed")
+
+
+def test_scan_error_messages_never_interpolate_a_value() -> None:
+    """The structural guard that closes the class rather than the witness.
+
+    main() prints ScanError text verbatim to stderr, so safety has to hold at
+    every construction site. Parsing the module is more durable than testing the
+    two sites that exist today: a future ScanError built from an f-string fails
+    here even if nobody thinks to write a behavioural test for it.
+    """
+    source = (Path(__file__).resolve().parents[1] / "scripts" / "privacy_scan.py").read_text()
+    offenders = [
+        node.lineno
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "ScanError"
+        and node.args
+        and isinstance(node.args[0], ast.JoinedStr)
+        and any(isinstance(part, ast.FormattedValue) for part in node.args[0].values)
+    ]
+    assert not offenders, f"ScanError built from interpolated data at lines {offenders}"
 
 
 _TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
