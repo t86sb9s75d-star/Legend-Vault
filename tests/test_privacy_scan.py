@@ -2182,6 +2182,46 @@ def test_scan_error_messages_never_interpolate_a_value() -> None:
     assert not offenders, f"ScanError built from interpolated data at lines {offenders}"
 
 
+# --- New-Code Invariant Gate: the missing three-state witness ----------------
+# Rule B requires every I/O boundary to distinguish success, LEGITIMATE EMPTY,
+# and failure. The worktree read path (_read_file_bounded, added with the
+# bounded-read fix) had witnesses for success, failure and boundary but none for
+# legitimate empty. Behaviour was already correct; the proof was absent.
+#
+# Classification: PROPERTY PIN, not a regression. It passes against the earlier
+# head too, because the defect was in the witness set rather than the code.
+
+
+def test_scan_of_empty_file_is_clean() -> None:
+    with tempfile.TemporaryDirectory() as d:
+        empty = Path(d) / "empty.txt"
+        empty.write_bytes(b"")
+        data, oversized = privacy_scan._read_file_bounded(empty, 1024)
+        assert (data, oversized) == (b"", False), "empty must read as success"
+        assert scan_tracked_entry("empty.txt", empty) == []
+
+
+def test_empty_file_is_distinguishable_from_an_unreadable_one() -> None:
+    # The distinction Rule B exists to protect: a fail-closed system must never
+    # collapse "could not read" into "read nothing".
+    with tempfile.TemporaryDirectory() as d:
+        empty = Path(d) / "empty.txt"
+        empty.write_bytes(b"")
+        missing = Path(d) / "gone.txt"
+        assert privacy_scan._read_file_bounded(empty, 1024)[1] is False
+        assert privacy_scan._read_file_bounded(missing, 1024)[1] is None
+        assert scan_tracked_entry("empty.txt", empty) == []
+        assert "LV-PRIV-007" in _ids(scan_tracked_entry("gone.txt", missing))
+
+
+def test_empty_file_with_archive_extension_fails_closed() -> None:
+    # Empty content that claims to be an archive is unscannable, not clean.
+    with tempfile.TemporaryDirectory() as d:
+        target = Path(d) / "empty.zip"
+        target.write_bytes(b"")
+        assert "LV-PRIV-007" in _ids(scan_tracked_entry("empty.zip", target))
+
+
 _TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
 
 
