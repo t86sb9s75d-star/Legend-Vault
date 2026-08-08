@@ -42,7 +42,9 @@ Deliberate limits (documented, not hidden)
 - ``LV-PRIV-005`` on a *name* is anchored: an archive member called
   ``/home/<user>/x`` is flagged, a relative one called ``home/<user>/x`` is not.
   A relative tree containing ``home/`` is ordinary inside an archive, and a
-  tracked path is repository-relative by construction.
+  tracked path is repository-relative by construction. The bare root
+  ``/home/<user>`` is flagged as well — it names the same user — while
+  ``/home/`` alone is not, since it exposes no identity.
 - Supported text encodings are exactly: UTF-8, Latin-1, UTF-16 LE/BE, UTF-32
   LE/BE. Other multibyte encodings are not decoded (their ASCII substrings are
   still visible through the Latin-1 view).
@@ -148,7 +150,25 @@ _PERSONAL = re.compile(
 # Local user home paths. POSIX form stays case-sensitive so "/users/" inside an
 # ordinary URL is not flagged; the Windows form is case-insensitive because a
 # drive-letter user path has no such collision.
-_LOCAL_PATH_POSIX = re.compile(r"(?:/home/|/Users/)[A-Za-z0-9._-]+/")
+#
+# Two alternatives, because the home directory ITSELF is a local private path:
+# `/home/<user>` reveals the same identifying username as `/home/<user>/x`, and
+# a descendant component does not make the user more private. The rule is
+# "local user home paths", and the bare root is one.
+#
+#   branch 1  a home path with a descendant   — unchanged
+#   branch 2  the bare home root              — added
+#
+# Branch 2 is deliberately narrower than branch 1 so that widening the rule adds
+# no false positives: it requires the match not to be preceded by an
+# alphanumeric (which excludes a URL such as `https://host/home/index`, where
+# the host's last character precedes the path) and not to be followed by more
+# path (that case is branch 1's). `_LOCAL_PATH_WIN` already flagged the bare
+# Windows root, so this also removes an inconsistency between the two spellings.
+_LOCAL_PATH_POSIX = re.compile(
+    r"(?:/home/|/Users/)[A-Za-z0-9._-]+/"
+    r"|(?<![A-Za-z0-9])(?:/home/|/Users/)[A-Za-z0-9._-]+(?![A-Za-z0-9._/-])"
+)
 _LOCAL_PATH_WIN = re.compile(r"[A-Za-z]:\\Users\\", re.IGNORECASE)
 
 # The same rule anchored to the start of a *name*. A tracked path is always
@@ -183,9 +203,12 @@ def _identity_component_index(components: list[str]) -> int | None:
     uncollapsed one, redacting `home` and printing the username: the rule went
     quiet because its trigger was destroyed, and the secret survived.
     """
-    if len(components) <= _LOCAL_USER_INDEX + 1:
-        # A trailing component is required, matching the content rule's trailing
-        # `/`: `/home/<user>` alone is not treated as a home path.
+    if len(components) <= _LOCAL_USER_INDEX:
+        # The username component must exist. A DESCENDANT component is not
+        # required: `/home/<user>` is itself a local home path and names the
+        # same user as `/home/<user>/x`. Requiring one was an implementation
+        # artifact justified only by the content rule's trailing slash — which
+        # was itself only an artifact, and which `_LOCAL_PATH_WIN` never shared.
         return None
     root, second = components[0], components[1]
     if not _LOCAL_USER.match(components[_LOCAL_USER_INDEX]):

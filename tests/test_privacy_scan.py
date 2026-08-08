@@ -1437,13 +1437,29 @@ def test_identity_index_and_absoluteness_agree() -> None:
         components = privacy_scan._path_components(path)
         assert privacy_scan._identity_component_index(components) is not None
         assert privacy_scan._is_absolute_local_path(path)
-    for path in (_FAKE_REPO_HOME_PATH, "home/alice/x.txt", f"{_HOME_ROOT}/{_IDENTITY}"):
+    # Negatives: repository-relative shapes, and a root carrying no username.
+    # `{_HOME_ROOT}/{_IDENTITY}` used to be asserted negative here too — the same
+    # wrong oracle as the old trailing-component test, reached from the other
+    # side. It is now a positive case below.
+    for path in (_FAKE_REPO_HOME_PATH, "home/alice/x.txt", _HOME_ROOT, _HOME_ROOT + "/"):
         assert not privacy_scan._is_absolute_local_path(path), path
+    assert privacy_scan._is_absolute_local_path(f"{_HOME_ROOT}/{_IDENTITY}")
 
 
-def test_home_path_without_trailing_component_is_not_flagged() -> None:
-    # Parity with the content rule, which requires a trailing `/`.
-    assert "LV-PRIV-005" not in rules_for_name(
+def test_bare_home_directory_is_flagged() -> None:
+    """Replaces test_home_path_without_trailing_component_is_not_flagged.
+
+    That test asserted a bare `/home/<user>` was safe, justified only by
+    "parity with the content rule, which requires a trailing `/`" — an
+    implementation detail defended by another implementation detail, with no
+    governing policy behind either. The rule is *local user home paths*, and the
+    home directory is one: it names the same user as any file inside it.
+
+    An owner review challenged the assertion rather than the code, which is the
+    only way a wrong oracle can be found — the suite cannot detect that its own
+    expected value is wrong.
+    """
+    assert "LV-PRIV-005" in rules_for_name(
         f"{_HOME_ROOT}/{_IDENTITY}", repo_relative=False
     )
 
@@ -2160,26 +2176,55 @@ def test_scan_repository_error_does_not_echo_its_argument() -> None:
     raise AssertionError("an unknown scan source must fail closed")
 
 
-def test_scan_error_messages_never_interpolate_a_value() -> None:
-    """The structural guard that closes the class rather than the witness.
+def test_scan_error_messages_are_string_literals() -> None:
+    """The structural guard, stated as the property rather than one syntax.
 
-    main() prints ScanError text verbatim to stderr, so safety has to hold at
-    every construction site. Parsing the module is more durable than testing the
-    two sites that exist today: a future ScanError built from an f-string fails
-    here even if nobody thinks to write a behavioural test for it.
+    main() prints ScanError text verbatim to stderr, so safety must hold at every
+    construction site. The first version of this guard rejected only f-strings,
+    which is one *way* of interpolating rather than the property itself —
+    `"x " + value`, `"x {}".format(value)` and `"x %s" % value` all bypassed it.
+
+    The invariant is: **a ScanError message is a fixed string literal**, so no
+    caller-controlled value can reach stderr through it.
+
+    FORWARD GUARD, not a fix. All five current sites already comply; no unsafe
+    behaviour was reproduced. This closes the remaining ways to violate the rule
+    in future, and is not counted as a defect fixed.
     """
     source = (Path(__file__).resolve().parents[1] / "scripts" / "privacy_scan.py").read_text()
-    offenders = [
-        node.lineno
-        for node in ast.walk(ast.parse(source))
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Name)
-        and node.func.id == "ScanError"
-        and node.args
-        and isinstance(node.args[0], ast.JoinedStr)
-        and any(isinstance(part, ast.FormattedValue) for part in node.args[0].values)
-    ]
-    assert not offenders, f"ScanError built from interpolated data at lines {offenders}"
+    offenders = []
+    for node in ast.walk(ast.parse(source)):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "ScanError"
+            and node.args
+        ):
+            arg = node.args[0]
+            if not (isinstance(arg, ast.Constant) and isinstance(arg.value, str)):
+                offenders.append((node.lineno, type(arg).__name__))
+    assert not offenders, f"ScanError message is not a string literal at {offenders}"
+
+
+def test_scan_error_guard_rejects_every_interpolation_form() -> None:
+    """Prove the guard can go red — for each bypass the old version allowed."""
+
+    def offends(expr: str) -> bool:
+        node = ast.parse(expr).body[0].value
+        arg = node.args[0]
+        return not (isinstance(arg, ast.Constant) and isinstance(arg.value, str))
+
+    for expr in (
+        'ScanError(f"bad {source!r}")',
+        'ScanError("bad " + source)',
+        'ScanError("bad {}".format(source))',
+        'ScanError("bad %s" % source)',
+        "ScanError(message)",
+    ):
+        assert offends(expr), f"guard would accept {expr}"
+    # …and still accepts a plain literal, including implicit concatenation.
+    assert not offends('ScanError("a fixed message")')
+    assert not offends('ScanError("a fixed " "message")')
 
 
 # --- New-Code Invariant Gate: the missing three-state witness ----------------
@@ -2220,6 +2265,120 @@ def test_empty_file_with_archive_extension_fails_closed() -> None:
         target = Path(d) / "empty.zip"
         target.write_bytes(b"")
         assert "LV-PRIV-007" in _ids(scan_tracked_entry("empty.zip", target))
+
+
+# =============================================================================
+# OWNER FINDING O4 — a bare home directory is a local private path
+# The identifying username is revealed by `/home/<user>` exactly as by
+# `/home/<user>/file.txt`. A descendant component does not make the user more
+# private, and `_LOCAL_PATH_WIN` had always flagged the bare Windows root, so
+# the three other spellings were also internally inconsistent.
+# Witnesses cover each production family that handles these differently.
+# =============================================================================
+
+_O4_USER = "alice"
+_O4_BARE = {
+    "posix": "/ho" + "me/" + _O4_USER,
+    "macos": "/Us" + "ers/" + _O4_USER,
+    "win_fwd": "C:/Us" + "ers/" + _O4_USER,
+    "win_native": "C:" + chr(92) + "Us" + "ers" + chr(92) + _O4_USER,
+}
+
+
+def test_o4_bare_home_detected_in_content() -> None:
+    for label, bare in _O4_BARE.items():
+        assert "LV-PRIV-005" in _ids(scan_text("f.md", bare)), label
+
+
+def test_o4_bare_home_detected_in_archive_member_name() -> None:
+    for label, bare in _O4_BARE.items():
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr(bare, b"innocuous")
+        assert "LV-PRIV-005" in _ids(scan_archive("a.zip", buf.getvalue(), kind="zip")), label
+
+
+def test_o4_bare_home_detected_in_tar_link_target() -> None:
+    for label, bare in _O4_BARE.items():
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w") as tf:
+            info = tarfile.TarInfo("link")
+            info.type = tarfile.SYMTYPE
+            info.linkname = bare
+            tf.addfile(info)
+        assert "LV-PRIV-005" in _ids(scan_archive("a.tar", buf.getvalue(), kind="tar")), label
+
+
+def test_o4_bare_home_detected_in_filesystem_symlink_target() -> None:
+    for label, bare in _O4_BARE.items():
+        if chr(92) in bare:
+            continue  # a native Windows path is not a valid POSIX link target here
+        with tempfile.TemporaryDirectory() as d:
+            link = Path(d) / "lnk"
+            link.symlink_to(bare)
+            assert "LV-PRIV-005" in _ids(scan_tracked_entry("lnk", link)), label
+
+
+def test_o4_bare_home_identity_is_redacted_in_output() -> None:
+    for label, bare in _O4_BARE.items():
+        rendered = safe_location(bare)
+        assert _O4_USER not in rendered, f"{label}: identity survived as {rendered!r}"
+
+
+def test_o4_cli_detects_bare_home_without_exposing_it() -> None:
+    # The real production entry point, for both a link target and a member name.
+    with tempfile.TemporaryDirectory() as d:
+        repo = Path(d)
+        subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.email", "t@invalid"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.name", "t"], cwd=repo, check=True)
+        (repo / "lnk").symlink_to(_O4_BARE["posix"])
+        subprocess.run(["git", "add", "-f", "lnk"], cwd=repo, check=True)
+        proc = subprocess.run(
+            [sys.executable, str(_SCANNER)], cwd=repo, capture_output=True, text=True
+        )
+    assert proc.returncode == 1
+    assert "LV-PRIV-005" in proc.stdout
+    assert _O4_USER not in proc.stdout + proc.stderr
+
+
+# --- O4 negative controls: widening must not create false positives ----------
+
+
+def test_o4_url_path_segments_are_not_flagged() -> None:
+    # The new branch is deliberately narrower than the existing one: a URL's
+    # host supplies an alphanumeric immediately before the path, which excludes
+    # it. Without this the widening would flag ordinary documentation links.
+    for text in (
+        "https://example.com/home/index",
+        "http://host.example/home/dashboard",
+        "https://example.com/Users/profile",
+        "see https://x.example/home/about for docs",
+    ):
+        assert "LV-PRIV-005" not in _ids(scan_text("f.md", text)), text
+
+
+def test_o4_repository_relative_equivalents_stay_clean() -> None:
+    for text in (f"docs/home/{_O4_USER}", f"home/{_O4_USER}", f"Users/{_O4_USER}"):
+        assert "LV-PRIV-005" not in _ids(scan_text("f.md", text)), text
+        assert "LV-PRIV-005" not in rules_for_name(text, repo_relative=False), text
+
+
+def test_o4_home_root_without_a_username_is_not_flagged() -> None:
+    # No identifying component is present, so there is nothing to protect.
+    for text in ("/home/", "/home", "/Users/", "/Users"):
+        assert "LV-PRIV-005" not in _ids(scan_text("f.md", text)), text
+
+
+def test_o4_word_beginning_with_home_is_not_flagged() -> None:
+    assert "LV-PRIV-005" not in _ids(scan_text("f.md", "/homeless-shelter/notes"))
+
+
+def test_o4_descendant_paths_still_detected() -> None:
+    # The pre-existing branch must be untouched by the addition.
+    for bare in _O4_BARE.values():
+        sep = chr(92) if chr(92) in bare else "/"
+        assert "LV-PRIV-005" in _ids(scan_text("f.md", bare + sep + "file.txt"))
 
 
 _TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]

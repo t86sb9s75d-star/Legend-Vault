@@ -366,5 +366,9 @@ exempted.
   `/home/<user>/x` is flagged, but a relative one called `home/<user>/x` is not.
   A relative tree containing `home/` is ordinary inside an archive, and treating
   it as a local path would false-positive on any tracked directory named `home`.
+  The **bare root** `/home/<user>` is flagged too: it names the same user, and a
+  descendant component does not make that user more private. What must be
+  present is the *username*, not something beneath it — `/home/` alone is not
+  flagged, because no identity is exposed.
 - The scanner sees the **current tree only**. It cannot detect or remove values
   that already exist in git history — see "Redaction vs. history" above.
