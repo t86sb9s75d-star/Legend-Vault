@@ -2381,6 +2381,88 @@ def test_o4_descendant_paths_still_detected() -> None:
         assert "LV-PRIV-005" in _ids(scan_text("f.md", bare + sep + "file.txt"))
 
 
+# --- Contract-accuracy guards -------------------------------------------------
+# A docstring that DEFINES a security invariant is part of the contract. When the
+# guard was strengthened from "no f-string" to "must be a literal" and renamed,
+# the docstring kept pointing at the old name and the old, weaker scope — so the
+# text at the definition site understated what is enforced and named a test that
+# no longer existed. A future editor reading it would believe `"x " + value` was
+# permitted. The fix is to correct the prose, never to weaken the guard to match.
+
+
+def test_scan_error_docstring_names_an_existing_test() -> None:
+    doc = privacy_scan.ScanError.__doc__ or ""
+    referenced = set(re.findall(r"test_[a-z0-9_]+", doc))
+    assert referenced, "the contract must name the test that enforces it"
+    defined = {
+        node.name
+        for node in ast.walk(ast.parse(Path(__file__).read_text()))
+        if isinstance(node, ast.FunctionDef)
+    }
+    missing = sorted(name for name in referenced if name not in defined)
+    assert not missing, f"ScanError docstring names non-existent test(s): {missing}"
+
+
+def test_scan_error_docstring_does_not_understate_the_guard() -> None:
+    # The enforced property is "string literal". Prose implying only f-strings
+    # are rejected is weaker than reality and misleads future edits.
+    doc = privacy_scan.ScanError.__doc__ or ""
+    assert "literal" in doc, "the contract must state the literal-only rule"
+    assert ".format(" in doc or "concatenat" in doc.lower(), (
+        "the contract must make clear that non-f-string interpolation is also rejected"
+    )
+
+
+def test_repo_root_failure_message_covers_both_causes() -> None:
+    """`_repo_root()` catches OSError *and* CalledProcessError.
+
+    Reproduces both classes through a subprocess and requires one accurate fixed
+    literal. Diagnostic correctness, not a privacy bypass — but the message is
+    still output, so it must name no path.
+    """
+    code = (
+        "import sys; sys.path.insert(0, %r); import privacy_scan as ps\n"
+        "try:\n"
+        "    ps._repo_root()\n"
+        "except ps.ScanError as e:\n"
+        "    print('SCANERROR:' + str(e))\n"
+        "else:\n"
+        "    print('NOERROR')\n"
+        % str(Path(__file__).resolve().parents[1] / "scripts")
+    )
+    messages = {}
+    # A: git cannot be executed at all.
+    with tempfile.TemporaryDirectory() as shim:
+        for tool in ("sh", "bash"):
+            found = shutil.which(tool)
+            if found:
+                os.symlink(found, os.path.join(shim, tool))
+        proc = subprocess.run(
+            [sys.executable, "-c", code],
+            cwd=str(Path(__file__).resolve().parents[1]),
+            env={**os.environ, "PATH": shim}, capture_output=True, text=True,
+        )
+        messages["git-unavailable"] = proc.stdout.strip()
+    # B: git works, but the working directory is not a repository.
+    with tempfile.TemporaryDirectory() as outside:
+        proc = subprocess.run(
+            [sys.executable, "-c", code], cwd=outside, capture_output=True, text=True
+        )
+        messages["not-a-repository"] = proc.stdout.strip()
+
+    expected = (
+        "cannot determine repository root "
+        "(git unavailable, or not inside a git repository)"
+    )
+    for label, out in messages.items():
+        assert out.startswith("SCANERROR:"), f"{label}: {out}"
+        text = out[len("SCANERROR:"):]
+        # Exact match, so the assertion cannot be satisfied vacuously: it pins
+        # both that the message names both causes and that it carries no path,
+        # for each cause independently.
+        assert text == expected, f"{label}: {text!r}"
+
+
 _TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
 
 

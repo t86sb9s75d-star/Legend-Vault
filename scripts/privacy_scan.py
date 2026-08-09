@@ -909,9 +909,13 @@ class ScanError(RuntimeError):
 
     **Its message is printed verbatim to stderr by main(), so it must never be
     built from a caller-supplied value.** Every message here is a fixed string
-    naming no path, no argument and no content. This is enforced structurally by
-    ``test_scan_error_messages_never_interpolate_a_value``, which parses this
-    module and rejects any ``ScanError`` constructed from an f-string.
+    naming no path, no argument and no content.
+
+    Enforced structurally by ``test_scan_error_messages_are_string_literals``,
+    which parses this module and requires the first argument of every
+    ``ScanError`` call to be a **string literal**. That rejects an f-string, and
+    equally ``"x " + value``, ``"x {}".format(value)``, ``"x %s" % value`` and a
+    bare name — interpolation is the hazard, not one syntax for it.
     """
 
 
@@ -924,7 +928,15 @@ def _repo_root() -> Path:
             check=True,
         )
     except (OSError, subprocess.CalledProcessError) as exc:
-        raise ScanError("cannot determine repository root (git unavailable)") from exc
+        # Two distinct causes reach this handler: OSError when git cannot be
+        # executed at all, and CalledProcessError when git ran and refused —
+        # most commonly because the working directory is not a repository. The
+        # message names both rather than asserting the first, and stays a fixed
+        # literal: it must not report which directory was tried.
+        raise ScanError(
+            "cannot determine repository root "
+            "(git unavailable, or not inside a git repository)"
+        ) from exc
     return Path(out.stdout.strip())
 
 
