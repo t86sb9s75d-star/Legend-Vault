@@ -2579,6 +2579,49 @@ def test_widened_redaction_does_not_widen_detection() -> None:
     assert privacy_scan._is_absolute_local_path("/ho" + "me/alice/x") is True
 
 
+
+# --- New-Code Invariant Gate on `_identity_component_indices` -----------------
+# The gate ran against the widened rendering and found three invariants that the
+# new path satisfied but that no committed witness pinned. Behaviour was already
+# correct, so these are PROPERTY PINS, not fixes, and are not counted as defects.
+
+
+def test_multi_root_markers_stay_positional() -> None:
+    """PROPERTY PIN: O1 must survive the widening.
+
+    With two roots the same username occupies two positions. The markers must be
+    ordinals — so the two occurrences get *different* markers — and must carry
+    nothing recomputable from a guess at the value.
+    """
+    rendered = safe_location(_FAKE_TWO_ROOTS)
+    ordinals = re.findall(r"<redacted-name:(\d+)>", rendered)
+    assert ordinals == ["1", "2"], rendered
+    for algorithm in (hashlib.sha256, hashlib.sha1, hashlib.md5):
+        digest = algorithm(_IDENTITY.encode()).hexdigest()
+        for width in (8, 10, 12, 16, len(digest)):
+            assert digest[:width] not in rendered, rendered
+
+
+def test_multi_root_name_with_surrogates_does_not_crash() -> None:
+    """PROPERTY PIN: rendering must stay total on the new path.
+
+    Reporting is the one place that may never raise: an unhandled traceback can
+    print the very name the renderer exists to withhold.
+    """
+    location = "/ho" + "me/b\udcffad/Us" + "ers/x\udcfey/f.txt"
+    rendered = safe_location(location)
+    assert str(privacy_scan.Finding(location, "LV-PRIV-005", 0))
+    assert privacy_scan._encode_total(rendered)
+
+
+def test_many_roots_render_without_leaking() -> None:
+    """PROPERTY PIN: no bound is assumed on how many roots a location may hold."""
+    location = "/ho" + "me/" + ("/ho" + "me/").join([_IDENTITY] * 200)
+    rendered = safe_location(location)
+    assert _IDENTITY not in rendered
+    assert "LV-PRIV-005" not in _ids(scan_text("", rendered))
+
+
 _TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
 
 
