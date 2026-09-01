@@ -181,6 +181,7 @@ _SLASH_RUN = re.compile(r"/{2,}")
 _WIN_DRIVE = re.compile(r"^[A-Za-z]:$")
 _LOCAL_USER = re.compile(r"^[A-Za-z0-9._-]+$")  # same charset as _LOCAL_PATH_POSIX
 _LOCAL_USER_INDEX = 2  # ["", "home", "<user>", …] and ["C:", "Users", "<user>", …]
+_LOCAL_ROOT_NAMES = ("home", "Users")  # same spellings as _LOCAL_PATH_POSIX
 
 
 def _path_components(name: str) -> list[str]:
@@ -218,6 +219,43 @@ def _identity_component_index(components: list[str]) -> int | None:
     if _WIN_DRIVE.match(root) and second.lower() == "users":
         return _LOCAL_USER_INDEX
     return None
+
+
+def _identity_component_indices(components: list[str]) -> set[int]:
+    """**Every** component position that names a user. Used for rendering.
+
+    ``_identity_component_index`` answers a different question — *is this name
+    an absolute local path* — and so reports only the root's username. Rendering
+    has a wider obligation, because a single location can carry more than one
+    local root: the content rule ``_LOCAL_PATH_POSIX`` matches an interior
+    ``/home/<user>/`` exactly as it matches a leading one.
+
+    Redacting only the first was a live leak. ``/home/<u>/Users/<u>/x`` rendered
+    as ``/home/<redacted-name:1>/Users/<u>/x`` — the username printed verbatim to
+    real stdout, beneath a line stating that sensitive values are not printed.
+    The structural guard stayed silent because it measured the rendered form with
+    ``rules_for_name``, which suppresses LV-PRIV-005 in favour of an anchored
+    whole-name test and therefore cannot see a second root at all. Feeding the
+    rendered form to ``scan_text`` — the rule that produced the finding — reports
+    it immediately, and that is the oracle the regression now uses.
+
+    This widens **redaction only**. ``_identity_component_index`` is untouched, so
+    no name becomes a finding that was not one before; the output merely stops
+    reproducing a value the scanner had already judged private.
+    """
+    indices: set[int] = set()
+    root = _identity_component_index(components)
+    if root is not None:
+        indices.add(root)
+    # An interior root needs a separator before it, which is what index >= 1
+    # means for a component list; index 0 would be a bare relative ``home/<u>``,
+    # which the content rule deliberately does not match.
+    for index in range(1, len(components) - 1):
+        if components[index] in _LOCAL_ROOT_NAMES and _LOCAL_USER.match(
+            components[index + 1]
+        ):
+            indices.add(index + 1)
+    return indices
 
 
 def _is_absolute_local_path(normalized: str) -> bool:
@@ -369,11 +407,12 @@ def safe_location(location: str) -> str:
     supplies digest context. A bare hash with no such context anywhere stays
     readable.
 
-    An absolute local home path is the other shape whose meaning lives in the
-    component *sequence* rather than in any one component: the username is only
-    identifying because ``home`` precedes it. ``_identity_component_index``
-    supplies that position, reading the same canonical component list that is
-    rendered here — runs of slashes are collapsed, so ``//home/<user>/y`` and
+    A local home path is the other shape whose meaning lives in the component
+    *sequence* rather than in any one component: the username is only identifying
+    because ``home`` precedes it. ``_identity_component_indices`` supplies
+    **every** such position — a location may carry more than one local root, and
+    redacting only the first printed the second verbatim — reading the same
+    canonical component list that is rendered here — runs of slashes are collapsed, so ``//home/<user>/y`` and
     ``/home/<user>/y`` cannot disagree about which component holds the username.
     Collapsing is mildly lossy for display and deliberately so: an output that
     is already non-verbatim by design gains nothing from preserving a slash run,
@@ -386,11 +425,11 @@ def safe_location(location: str) -> str:
         # Both the decision and the rendering read this one component list, so a
         # repeated slash cannot shift the index out from under the redaction.
         components = _path_components(chunk)
-        identity = _identity_component_index(components)
+        identities = _identity_component_indices(components)
         parts = []
         for index, component in enumerate(components):
             if (
-                index == identity
+                index in identities
                 or _component_is_unsafe(component)
                 or (location_has_digest_context and _HEX64.search(component))
             ):

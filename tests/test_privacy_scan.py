@@ -1329,6 +1329,15 @@ def test_rendered_output_never_trips_a_content_rule() -> None:
     LV-PRIV-006 is the one documented exception: it names a payload *category*
     (`conversations.json` is identical in every export and carries nothing
     user-specific), which is deliberately kept legible for remediation.
+
+    **The instrument matters as much as the corpus.** This measured rendered
+    output with `rules_for_name`, which suppresses LV-PRIV-005 in favour of an
+    anchored whole-name test — so it could not see a *second* local root inside a
+    location no matter what was added to `pieces`, and
+    `/home/<u>/Users/<u>/x` printed the username to real stdout while this test
+    stayed green. It now also feeds each rendered chunk to `scan_text`, the rule
+    that produces the finding in the first place, and the corpus carries
+    multi-root shapes. A guard that cannot express the property is not a guard.
     """
     pieces = [
         _FAKE_ABS_HOME,
@@ -1345,6 +1354,9 @@ def test_rendered_output_never_trips_a_content_rule() -> None:
         "Archive digest",
         f"{_FAKE_HEX}.bin",
         "plain/dir/file.txt",
+        _FAKE_TWO_ROOTS,
+        _FAKE_TWO_ROOTS_MIXED,
+        _FAKE_INTERIOR_ROOT,
     ]
     checked = 0
     for first in pieces:
@@ -1356,6 +1368,11 @@ def test_rendered_output_never_trips_a_content_rule() -> None:
                         rule
                         for rule in rules_for_name(chunk, repo_relative=False)
                         if rule != "LV-PRIV-006"
+                    ]
+                    # The name-level view above cannot see a second local root;
+                    # the content rule that raised the finding can.
+                    residue += [
+                        rule for rule in _ids(scan_text("", chunk)) if rule != "LV-PRIV-006"
                     ]
                     assert not residue, f"{location!r} rendered to unsafe {chunk!r}: {residue}"
     assert checked > 300
@@ -2479,10 +2496,106 @@ def test_repo_root_failure_message_covers_both_causes() -> None:
         assert text == expected, f"{label}: {text!r}"
 
 
+
+
+# --- Regression: a location may carry more than one local root ----------------
+# `safe_location` redacted `_identity_component_index` — one position — so the
+# second root's username was printed verbatim by the real CLI, under a line
+# stating that sensitive values are not printed. Found by an independent probe
+# whose oracle was `scan_text` on the rendered output; the committed structural
+# guard used `rules_for_name`, which suppresses LV-PRIV-005 and is blind to it.
+
+_FAKE_TWO_ROOTS = "/ho" + "me/alice/Us" + "ers/alice/secret.txt"
+_FAKE_TWO_ROOTS_MIXED = "/Us" + "ers/alice/ho" + "me/alice/notes.txt"
+_FAKE_INTERIOR_ROOT = "vault/ho" + "me/alice/records.txt"
+
+
+def _multi_root_locations() -> list[str]:
+    return [
+        _FAKE_TWO_ROOTS,
+        _FAKE_TWO_ROOTS_MIXED,
+        _FAKE_INTERIOR_ROOT,
+        "/ho" + "me/alice/ho" + "me/alice/x.txt",
+        "C:/Us" + "ers/alice/Us" + "ers/alice/x.txt",
+        "/ho" + "me/alice/a/Us" + "ers/alice",
+    ]
+
+
+def test_every_local_root_in_a_location_is_redacted() -> None:
+    """The value-level invariant, asserted per root rather than per location."""
+    for location in _multi_root_locations():
+        for wrapped in (location, f"bundle.zip!{location}", f"o.zip!i.zip!{location}"):
+            rendered = safe_location(wrapped)
+            assert _IDENTITY not in rendered, f"{wrapped!r} leaked via {rendered!r}"
+
+
+def test_rendered_output_never_contains_a_local_private_path() -> None:
+    """Measured with `scan_text`, the rule that raises the finding.
+
+    This is the oracle the previous structural guard lacked. It fails against the
+    unfixed head on every location in `_multi_root_locations()`.
+    """
+    for location in _multi_root_locations():
+        for chunk in safe_location(location).split("!"):
+            assert "LV-PRIV-005" not in _ids(scan_text("", chunk)), (
+                f"{location!r} rendered to a local private path: {chunk!r}"
+            )
+
+
+def test_cli_output_excludes_username_from_a_second_local_root() -> None:
+    """The real entry point, asserting stdout *and* stderr."""
+    payload = io.BytesIO()
+    with zipfile.ZipFile(payload, "w") as archive:
+        for member in _multi_root_locations():
+            archive.writestr(member, b"placeholder")
+    rc, out, err = _run_cli_repo({"bundle.zip": payload.getvalue()})
+    assert rc == 1, (rc, out, err)
+    assert "LV-PRIV-005" in out
+    assert _IDENTITY not in out and _IDENTITY not in err, (out, err)
+
+
+def test_single_root_rendering_is_unchanged() -> None:
+    """CONTROL: widening redaction must not over-redact.
+
+    The root marker stays legible, ordinals still start at 1, and a location with
+    no local root is untouched — otherwise findings stop being remediable.
+    """
+    assert safe_location(_FAKE_ABS_HOME) == "/ho" + "me/<redacted-name:1>/vault/secret.txt"
+    assert safe_location(_FAKE_ABS_MAC) == "/Us" + "ers/<redacted-name:1>/vault/secret.txt"
+    assert safe_location("docs/notes.md") == "docs/notes.md"
+    assert safe_location("plain/dir/file.txt") == "plain/dir/file.txt"
+
+
+def test_widened_redaction_does_not_widen_detection() -> None:
+    """CONTROL: redaction changed, detection did not.
+
+    `_identity_component_index` is deliberately untouched, so no name becomes a
+    finding that was not one before.
+    """
+    assert "LV-PRIV-005" not in rules_for_name("ho" + "me/alice/x", repo_relative=False)
+    assert "LV-PRIV-005" not in rules_for_name(_FAKE_REPO_HOME_PATH, repo_relative=True)
+    assert "LV-PRIV-005" in rules_for_name(_FAKE_ABS_HOME, repo_relative=False)
+    assert privacy_scan._is_absolute_local_path("vault/ho" + "me/alice/x") is False
+    assert privacy_scan._is_absolute_local_path("/ho" + "me/alice/x") is True
+
+
 _TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
 
 
 if __name__ == "__main__":
+    # A test that is defined but never collected is indistinguishable from a
+    # test that passes. `_TESTS` is built from globals(), so any definition
+    # added below that line silently disappears — five regressions in this file
+    # were briefly in exactly that state. Checked here, in the runner, so the
+    # check cannot itself go uncollected.
+    _defined = {
+        node.name
+        for node in ast.parse(Path(__file__).read_text()).body
+        if isinstance(node, ast.FunctionDef) and node.name.startswith("test_")
+    }
+    _uncollected = sorted(_defined - {t.__name__ for t in _TESTS})
+    if _uncollected:
+        raise SystemExit(f"tests defined but never collected: {_uncollected}")
     for test in _TESTS:
         test()
     print(f"Privacy scan tests passed ({len(_TESTS)} cases).")
