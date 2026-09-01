@@ -318,7 +318,10 @@ position render identically.
 Two rules mean something only across a *sequence* of components rather than
 within one, and both are evaluated at that scope: a digest label may sit in one
 component with the digest in another, and `alice` is identifying only because
-`home` precedes it. Safe components are preserved so the entry stays
+`home` precedes it. A location may contain **more than one** local root, and
+every one of them is redacted — redacting only the first printed the second
+username verbatim, so the rendering asks which components a local root precedes,
+not which single component sits at the root. Safe components are preserved so the entry stays
 identifiable for remediation, the rendering is deterministic for a given
 *location*, and neither the prohibited substring nor any digest of it reaches
 stdout, stderr, or CI logs. Error paths
@@ -328,10 +331,20 @@ follow the same rule: the fail-closed `ScanError` message names no path at all.
 found in review so far had one shape — a value correctly detected, then
 reproduced by the code reporting it. So rather than testing instances,
 `test_rendered_output_never_trips_a_content_rule` renders a cross-product of
-location shapes and asserts each rendered chunk is itself judged clean under the
-strictest reading of the name rules. `LV-PRIV-006` is the single documented
-exception: it names a payload *category* (`conversations.json` is identical in
-every export and carries nothing user-specific), kept legible for remediation.
+location shapes and asserts each rendered chunk is itself judged clean.
+`LV-PRIV-006` is the single documented exception: it names a payload *category*
+(`conversations.json` is identical in every export and carries nothing
+user-specific), kept legible for remediation.
+
+**The instrument matters as much as the corpus.** This paragraph previously
+claimed the check applied "the strictest reading of the name rules". It did not,
+and the claim was itself the problem: the guard measured rendered output only
+with `rules_for_name`, which suppresses `LV-PRIV-005` in favour of an anchored
+whole-name test and so could not see a second local root *whatever* was added to
+its corpus. A location with two roots printed the username to real stdout while
+this guard stayed green. It now measures with `scan_text` as well — the rule that
+raises the finding in the first place — and enlarging a corpus is understood not
+to compensate for an oracle that cannot express the property.
 
 ### Exemption philosophy
 

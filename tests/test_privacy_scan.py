@@ -2622,6 +2622,41 @@ def test_many_roots_render_without_leaking() -> None:
     assert "LV-PRIV-005" not in _ids(scan_text("", rendered))
 
 
+
+def test_documented_structural_guard_uses_both_oracles() -> None:
+    """The policy document describes the structural guard; the code must match.
+
+    Deliberately **behavioural, not keyword-matching**. An earlier documentation
+    guard in this file asserted that a word appeared in a docstring, and was
+    always true because the word also occurred in a quoted identifier that a
+    sibling guard pinned in place. So this one does not look for prose at all
+    beyond the test's name: it takes the guard named by the document, requires
+    that function to exist, and then requires — by parsing it — that its body
+    actually calls **both** `rules_for_name` and `scan_text`. Removing either
+    oracle turns this red, which is precisely the change that let a second local
+    root reach stdout while the guard stayed green.
+    """
+    doc = (_repo_root() / "docs" / "PRIVATE_DATA_BOUNDARY.md").read_text()
+    named = set(re.findall(r"test_rendered_output_[a-z0-9_]+", doc))
+    assert named, "the document must name the structural guard it describes"
+    source = ast.parse(Path(__file__).read_text())
+    defined = {
+        node.name: node
+        for node in source.body
+        if isinstance(node, ast.FunctionDef)
+    }
+    for name in sorted(named):
+        assert name in defined, f"document names a non-existent guard: {name}"
+        called = {
+            node.func.id
+            for node in ast.walk(defined[name])
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        }
+        assert {"rules_for_name", "scan_text"} <= called, (
+            f"{name} no longer measures with both oracles; it calls {sorted(called)}"
+        )
+
+
 _TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
 
 
