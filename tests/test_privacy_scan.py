@@ -2404,10 +2404,26 @@ def test_scan_error_docstring_names_an_existing_test() -> None:
 
 
 def test_scan_error_docstring_does_not_understate_the_guard() -> None:
-    # The enforced property is "string literal". Prose implying only f-strings
-    # are rejected is weaker than reality and misleads future edits.
+    """The contract must state the guard at its real strength.
+
+    The first version of this witness asserted ``"literal" in doc``, which was
+    **always true and therefore no evidence at all**: the word also occurs
+    inside the quoted test name ``test_scan_error_messages_are_string_literals``,
+    and the sibling guard above pins that name in place. Deleting the sentence
+    that states the rule left this assertion green.
+
+    A documentation guard has to measure the *claim*, not a word that happens to
+    appear near it. The rule statement is prose, so it is matched against the
+    docstring with ``code spans`` removed; the examples of rejected non-f-string
+    interpolation are deliberately written *as* code spans, so that half is
+    matched against the whole docstring.
+    """
     doc = privacy_scan.ScanError.__doc__ or ""
-    assert "literal" in doc, "the contract must state the literal-only rule"
+    prose = re.sub(r"``[^`]*``", " ", doc)
+    assert "string literal" in prose, (
+        "the contract must state the literal-only rule in prose, not merely "
+        "name a test whose identifier contains the word"
+    )
     assert ".format(" in doc or "concatenat" in doc.lower(), (
         "the contract must make clear that non-f-string interpolation is also rejected"
     )
