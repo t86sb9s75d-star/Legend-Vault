@@ -140,3 +140,248 @@ If real export content is committed (or reaches a remote):
    notify anyone who may have cloned or fetched.
 5. Record the incident (what, when, scope) in a private note — not in this repo.
 6. Add or tighten a guard/ignore so the same class of data cannot re-enter.
+
+## Redaction vs. history
+
+Editing or removing a value in the current working tree does **not** erase it
+from the repository's history. Earlier commits still contain the old content,
+and on a public repository that content has already been exposed and may be
+cloned, forked, cached, or mirrored.
+
+- **Current-tree redaction** (what a normal remediation PR does) stops the value
+  from appearing in the *latest* tree and prevents accidental re-use going
+  forward.
+- **History cleanup** (removing the value from *all* prior commits, e.g. with
+  `git filter-repo`) is a **separate, destructive, coordinated** operation. It
+  rewrites commit hashes, requires an authorized force-update, and must be
+  coordinated with everyone who has cloned or forked. It is decided and executed
+  on its own, after the redaction PR is merged — never bundled into it.
+
+## Correlatable identifiers
+
+A hash is not automatically safe to publish. The **SHA-256 of a real private
+export** is a stable fingerprint: anyone who holds the same export can confirm
+it matches this repository. Treat digests, receipts, and derived measurements of
+private source material as **correlatable identifiers**, not as anonymous
+metadata. Hashes of *public* source files (e.g. a source-code manifest) are fine
+because the files themselves are already public.
+
+## Synthetic fixtures
+
+Synthetic fixtures must be **invented**, never copied from a real export. Do not
+paste real filenames, digests, dates, counts, titles, or content into fixtures,
+tests, snapshots, or reports. If a report needs example numbers, label them
+clearly as synthetic; if it documents real-export measurements, state that they
+were removed and kept only in private audit records outside the repository.
+
+## Preventive scanning
+
+`scripts/privacy_scan.py` is a deterministic, offline, fail-closed scanner that
+reports only `path:line: RULE-ID` (never the matched value) and exits non-zero on
+any finding.
+
+**It has two modes, and each names its own source of truth.** These are different
+states and are not interchangeable — the index is what git will commit, the
+working tree is what happens to be on disk right now:
+
+| Mode | Enumerates | Reads | Used by |
+|---|---|---|---|
+| `--worktree` (default) | `git ls-files` | the file on disk | CI, where the checkout matches the commit |
+| `--staged` | `git ls-files -s` | the **staged blob**, via `git cat-file` | the pre-commit hook |
+
+Earlier revisions enumerated the index and then read the working tree while
+claiming staged additions were covered. They were not: a file staged with a
+prohibited value whose on-disk copy was replaced with safe text passed the scan.
+Staged mode now takes both entry identity and content from git, so no divergent
+on-disk copy can hide a staged value, and it handles blobs, symlink targets
+(git stores the target as the blob), gitlinks, and non-UTF-8 paths. An unknown
+argument exits `2` rather than being ignored.
+
+Rules:
+
+- `LV-PRIV-001` private-export-identifier (real-export archive names)
+- `LV-PRIV-002` private-export-digest (a full SHA-256 near a source/export
+  digest label)
+- `LV-PRIV-003` secret-pattern (private-key blocks, API-key/token shapes)
+- `LV-PRIV-004` personal-identifier (emails, account/user IDs with real values)
+- `LV-PRIV-005` local-private-path (local user home paths)
+- `LV-PRIV-006` raw-export-payload (known raw-export payload filenames)
+- `LV-PRIV-007` unscannable-content (unreadable, undecodable, malformed,
+  encrypted, unsupported-format, oversized, or too deeply nested content)
+
+### What "fail closed" means here
+
+The scanner never silently skips content. Anything it cannot read, decode,
+parse, or bound becomes an explicit `LV-PRIV-007` finding — an unscannable file
+fails the scan rather than passing by omission. If git itself cannot be queried,
+the scan exits non-zero instead of reporting success.
+
+### Encoding and binary handling
+
+Encoding is not trusted. Every byte stream is scanned through several text
+views — UTF-8 (lossy) and Latin-1 always, UTF-16 LE/BE when a NUL byte is
+present, and UTF-32 LE/BE when a NUL-run or BOM indicates it — so UTF-16/UTF-32
+text, Latin-1 text, and ASCII embedded inside otherwise-binary content are all
+covered. There is no "looks binary, skip it" path. The supported set is exactly
+those encodings; other multibyte encodings are not decoded, though their ASCII
+substrings remain visible through the Latin-1 view.
+
+### Archive handling
+
+A recognised archive is always either inspected or rejected — never passed
+through as ordinary bytes:
+
+| Format | Behaviour |
+|---|---|
+| ZIP | inspected in memory, recursively |
+| TAR (plain, `.gz`, `.bz2`, `.xz`) | inspected in memory, recursively |
+| GZIP / BZIP2 / XZ single streams | decompressed under the byte budget, then inspected |
+| 7z, RAR | **not parsed** — reported `LV-PRIV-007` (fail closed) rather than treated as scanned |
+| malformed / encrypted / oversized | reported `LV-PRIV-007` |
+
+Detection is by **signature first, extension second**, so an archive renamed to
+`.md` is still treated as an archive, and a prose file merely *named* like an
+archive is not. Members are read **in memory and never extracted** to disk or
+into the repository. Nested archives are followed to a bounded depth.
+
+The extension half of that rule covers **every** recognised compression
+extension — `.gz`, `.bz2`, `.xz`, `.lzma` — not just the common one. A damaged
+or truncated stream loses its magic bytes, and a format missing from the
+fallback would then be treated as ordinary bytes and read as "no findings",
+because the payload is still compressed and therefore invisible to every text
+view. That is a silent miss rather than a harmless mislabel, so the fallback
+fails closed to `LV-PRIV-007` instead.
+
+#### Resource accounting is debit-on-consumption
+
+The byte budget measures **expanded bytes inspected** — decompressed or
+extracted output the scanner actually reads. Every read goes through one helper
+that charges the shared budget **at the moment bytes are consumed**, before any
+validation decision. Bytes read from content that is then rejected as oversized,
+malformed, unreadable, or otherwise `LV-PRIV-007` are charged exactly the same,
+so a crafted archive cannot obtain free reads by failing repeatedly. A read that
+raises mid-way is charged its full allowance, so an exception cannot restore
+capacity. A declared member size is treated only as a preflight signal; actual
+consumption is authoritative. When the shared budget is exhausted the containing
+archive scan stops and is reported `LV-PRIV-007` rather than partially trusted.
+
+**Exact guarantee:** total consumption across a scan is at most
+`_MAX_TOTAL_BYTES + 1`. The single extra byte is the sentinel that distinguishes
+"exactly at the limit" from "over the limit" on the final read; it is charged
+like any other byte, so the overshoot is a constant, not per member — verified
+against archives holding 1 to 200 malicious members. Compressed input bytes are
+not charged separately; each expansion level is charged once as it expands, so
+a nested member is charged at each level it is expanded through. The tracked
+file's own bytes are read from disk under the per-file size cap and are not part
+of this budget.
+
+### Names, symlinks, and safe output
+
+A name is itself text that can leak, so path and archive-member names are
+scanned with the same canonical rules used for content, including the contextual
+digest rule. Name rules run even when content cannot be read — which is the only
+thing that can be inspected for a directory entry, since it has no content at
+all. Symlinks are never followed; the link's **target string** is scanned, which
+is what git stores, and the same applies to a link target recorded inside a tar
+header.
+
+The local-path rule is the one rule that depends on *who is asking*, because
+only some names can be absolute:
+
+| name comes from | guarantee | `LV-PRIV-005` |
+|---|---|---|
+| `git ls-files` (tracked path) | always repository-relative | not applied — a directory legitimately called `docs/home/<user>/` is not a home directory |
+| archive member name | none; chosen by whoever built the archive | applied, **anchored** — `/home/<user>/x` is flagged, relative `home/<user>/x` is not |
+
+Callers state which case they are in explicitly, because guessing wrong is a
+detection gap in one direction and a false positive in the other.
+
+Because a name can *be* the prohibited value, scanner output never prints a
+location verbatim. Each path component is checked, and an unsafe component is
+replaced by a **positional** marker — numbered by where it sits, never derived
+from what it contains:
+
+```text
+docs/<redacted-name:1>/notes.md:0: LV-PRIV-004
+bundle.zip!/home/<redacted-name:1>/vault/secret.txt:0: LV-PRIV-005
+```
+
+This marker used to be `sha256(component)[:12]`, and that was wrong on this
+document's own terms. A 48-bit digest of a private value is a **correlatable
+identifier**: anyone holding a candidate could hash it and confirm the match,
+and the same value produced the same marker everywhere, linking occurrences
+across a report. Substituting a different unkeyed hash would preserve the defect
+— the requirement is that nothing published be recomputable from a guess at the
+secret. A positional ordinal cannot be, so two different secrets in the same
+position render identically.
+
+Two rules mean something only across a *sequence* of components rather than
+within one, and both are evaluated at that scope: a digest label may sit in one
+component with the digest in another, and `alice` is identifying only because
+`home` precedes it. A location may contain **more than one** local root, and
+every one of them is redacted — redacting only the first printed the second
+username verbatim, so the rendering asks which components a local root precedes,
+not which single component sits at the root. Safe components are preserved so the entry stays
+identifiable for remediation, the rendering is deterministic for a given
+*location*, and neither the prohibited substring nor any digest of it reaches
+stdout, stderr, or CI logs. Error paths
+follow the same rule: the fail-closed `ScanError` message names no path at all.
+
+**Rendered output is checked against the rules that produced it.** Every leak
+found in review so far had one shape — a value correctly detected, then
+reproduced by the code reporting it. So rather than testing instances,
+`test_rendered_output_never_trips_a_content_rule` renders a cross-product of
+location shapes and asserts each rendered chunk is itself judged clean.
+`LV-PRIV-006` is the single documented exception: it names a payload *category*
+(`conversations.json` is identical in every export and carries nothing
+user-specific), kept legible for remediation.
+
+**The instrument matters as much as the corpus.** This paragraph previously
+claimed the check applied "the strictest reading of the name rules". It did not,
+and the claim was itself the problem: the guard measured rendered output only
+with `rules_for_name`, which suppresses `LV-PRIV-005` in favour of an anchored
+whole-name test and so could not see a second local root *whatever* was added to
+its corpus. A location with two roots printed the username to real stdout while
+this guard stayed green. It now measures with `scan_text` as well — the rule that
+raises the finding in the first place — and enlarging a corpus is understood not
+to compensate for an oracle that cannot express the property.
+
+### Exemption philosophy
+
+**No file is exempt from every rule.** There is no whole-file allowlist, and no
+inline "suppress this" comment anyone can add. An exemption is a single entry
+keyed by *(path, rule, SHA-256 of the exact stripped line)*, which makes it:
+
+- **narrow** — one rule, on one line, in one file;
+- **alteration-sensitive** — edit that line and the exemption stops applying, so
+  neighbouring text can never inherit trust;
+- **documented** — every entry carries a written reason;
+- **deterministic** — no environment input, no heuristics.
+
+Today the repository has exactly three exemptions, all on `.gitignore`, all for
+`LV-PRIV-001`: those lines must literally name the export archives they exclude.
+`scripts/privacy_scan.py` and `tests/test_privacy_scan.py` contain rule-shaped
+text yet hold **no exemptions at all** — their prohibited shapes are assembled
+at runtime from fragments, so a real secret pasted into either file is still
+detected. Tests assert all of this, including that `LV-PRIV-007` can never be
+exempted.
+
+### Known limits (do not overstate the guarantee)
+
+- Detection is **pattern- and context-based**. It cannot recognise an arbitrary
+  private value that carries no recognisable shape or nearby label.
+- `LV-PRIV-002` binds a digest to a label within a small line window. A digest
+  deliberately separated from any label by more than that window, or carrying no
+  label at all, is indistinguishable from a public hash and is not flagged.
+- Obfuscated forms (e.g. an address written as `name [at] example.com`) are not
+  matched; the false-positive cost of matching them is too high.
+- `LV-PRIV-005` on a *name* is **anchored**: an archive member called
+  `/home/<user>/x` is flagged, but a relative one called `home/<user>/x` is not.
+  A relative tree containing `home/` is ordinary inside an archive, and treating
+  it as a local path would false-positive on any tracked directory named `home`.
+  The **bare root** `/home/<user>` is flagged too: it names the same user, and a
+  descendant component does not make that user more private. What must be
+  present is the *username*, not something beneath it — `/home/` alone is not
+  flagged, because no identity is exposed.
+- The scanner sees the **current tree only**. It cannot detect or remove values
+  that already exist in git history — see "Redaction vs. history" above.
